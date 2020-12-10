@@ -27,12 +27,10 @@ PY_MMS=("3.6"
         "3.8"
         "3.9")
 
-# The minimum supported numpy version is 1.14, see
-# https://issues.apache.org/jira/browse/ARROW-3141
-NUMPY_VERSIONS=("1.14.5"
-                "1.14.5"
-                "1.14.5"
-                "1.14.5")
+NUMPY_VERSIONS=("1.19.3"
+                "1.19.3"
+                "1.19.3"
+                "1.19.3")
 
 ./ci/travis/install-bazel.sh
 

@@ -139,7 +139,7 @@ install_requires = [
     "grpcio >= 1.28.1",
     "jsonschema",
     "msgpack >= 1.0.0, < 2.0.0",
-    "numpy >= 1.16",
+    "numpy >= 1.19.3",
     "protobuf >= 3.8.0",
     "py-spy >= 0.2.0",
     "pyyaml",
