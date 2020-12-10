@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # before these files have been created, so we have to move the files
 # manually.
 
-SUPPORTED_PYTHONS = [(3, 6), (3, 7), (3, 8)]
+SUPPORTED_PYTHONS = [(3, 6), (3, 7), (3, 8), (3, 9)]
 SUPPORTED_BAZEL = (3, 2, 0)
 
 ROOT_DIR = os.path.dirname(__file__)
@@ -440,6 +440,12 @@ setuptools.setup(
     url="https://github.com/ray-project/ray",
     keywords=("ray distributed parallel machine-learning "
               "reinforcement-learning deep-learning python"),
+    classifiers=[
+        "Programming Language :: Python :: 3.6",
+        "Programming Language :: Python :: 3.7",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+    ],
     packages=setuptools.find_packages(),
     cmdclass={"build_ext": build_ext},
     # The BinaryDistribution argument triggers build_ext.
