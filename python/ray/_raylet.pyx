@@ -17,6 +17,7 @@ import os
 import pickle
 import sys
 import _thread
+print(sys.path)
 import setproctitle
 
 from libc.stdint cimport (
