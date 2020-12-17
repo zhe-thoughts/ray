@@ -10,14 +10,11 @@ except ImportError:
 import sys
 import tempfile
 import datetime
+import setproctitle
 
 import ray
 import ray.test_utils
 import ray.cluster_utils
-
-# NOTE: We have to import setproctitle after ray because we bundle setproctitle
-# with ray.
-import setproctitle
 
 
 def test_caching_actors(shutdown_only):
