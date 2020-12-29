@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # before these files have been created, so we have to move the files
 # manually.
 
-SUPPORTED_PYTHONS = [(3, 6), (3, 7), (3, 8)]
+SUPPORTED_PYTHONS = [(3, 6), (3, 7), (3, 8), (3, 9)]
 SUPPORTED_BAZEL = (3, 2, 0)
 
 ROOT_DIR = os.path.dirname(__file__)
@@ -138,11 +138,13 @@ install_requires = [
     "grpcio >= 1.28.1",
     "jsonschema",
     "msgpack >= 1.0.0, < 2.0.0",
-    "numpy >= 1.16",
+    "numpy >= 1.16; python_version < '3.9'",
+    "numpy >= 1.19.3; python_version >= '3.9'",
     "protobuf >= 3.8.0",
     "py-spy >= 0.2.0",
     "pyyaml",
     "requests",
+    "setproctitle",
     "redis >= 3.5.0",
     "opencensus",
     "prometheus_client >= 0.7.1",
@@ -270,7 +272,7 @@ def build(build_python, build_java):
     # that certain flags will not be passed along such as --user or sudo.
     # TODO(rkn): Fix this.
     if not os.getenv("SKIP_THIRDPARTY_INSTALL"):
-        pip_packages = ["psutil", "setproctitle==1.1.10"]
+        pip_packages = ["psutil"]
         subprocess.check_call(
             [
                 sys.executable, "-m", "pip", "install", "-q",
@@ -439,6 +441,12 @@ setuptools.setup(
     url="https://github.com/ray-project/ray",
     keywords=("ray distributed parallel machine-learning "
               "reinforcement-learning deep-learning python"),
+    classifiers=[
+        "Programming Language :: Python :: 3.6",
+        "Programming Language :: Python :: 3.7",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+    ],
     packages=setuptools.find_packages(),
     cmdclass={"build_ext": build_ext},
     # The BinaryDistribution argument triggers build_ext.

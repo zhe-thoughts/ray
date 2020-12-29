@@ -49,19 +49,23 @@ instead of the ones above:
 ===================  ===================  ======================
        Linux                MacOS         Windows (experimental)
 ===================  ===================  ======================
+`Linux Python 3.9`_  `MacOS Python 3.9`_  `Windows Python 3.9`_
 `Linux Python 3.8`_  `MacOS Python 3.8`_  `Windows Python 3.8`_
 `Linux Python 3.7`_  `MacOS Python 3.7`_  `Windows Python 3.7`_
 `Linux Python 3.6`_  `MacOS Python 3.6`_  `Windows Python 3.6`_
 ===================  ===================  ======================
 
+.. _`Linux Python 3.9`: https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-1.2.0.dev0-cp39-cp39-manylinux2014_x86_64.whl
 .. _`Linux Python 3.8`: https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-1.2.0.dev0-cp38-cp38-manylinux2014_x86_64.whl
 .. _`Linux Python 3.7`: https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-1.2.0.dev0-cp37-cp37m-manylinux2014_x86_64.whl
 .. _`Linux Python 3.6`: https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-1.2.0.dev0-cp36-cp36m-manylinux2014_x86_64.whl
 
+.. _`MacOS Python 3.9`: https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-1.2.0.dev0-cp39-cp39-macosx_10_13_x86_64.whl
 .. _`MacOS Python 3.8`: https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-1.2.0.dev0-cp38-cp38-macosx_10_13_x86_64.whl
 .. _`MacOS Python 3.7`: https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-1.2.0.dev0-cp37-cp37m-macosx_10_13_intel.whl
 .. _`MacOS Python 3.6`: https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-1.2.0.dev0-cp36-cp36m-macosx_10_13_intel.whl
 
+.. _`Windows Python 3.9`: https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-1.2.0.dev0-cp39-cp39-win_amd64.whl
 .. _`Windows Python 3.8`: https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-1.2.0.dev0-cp38-cp38-win_amd64.whl
 .. _`Windows Python 3.7`: https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-1.2.0.dev0-cp37-cp37m-win_amd64.whl
 .. _`Windows Python 3.6`: https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-1.2.0.dev0-cp36-cp36m-win_amd64.whl
@@ -336,32 +340,3 @@ that you've cloned the git repository.
 .. code-block:: bash
 
   python -m pytest -v python/ray/tests/test_mini.py
-
-Troubleshooting
----------------
-
-If importing Ray (``python3 -c "import ray"``) in your development clone results
-in this error:
-
-.. code-block:: python
-
-  Traceback (most recent call last):
-    File "<string>", line 1, in <module>
-    File ".../ray/python/ray/__init__.py", line 63, in <module>
-      import ray._raylet  # noqa: E402
-    File "python/ray/_raylet.pyx", line 98, in init ray._raylet
-      import ray.memory_monitor as memory_monitor
-    File ".../ray/python/ray/memory_monitor.py", line 9, in <module>
-      import psutil  # noqa E402
-    File ".../ray/python/ray/thirdparty_files/psutil/__init__.py", line 159, in <module>
-      from . import _psosx as _psplatform
-    File ".../ray/python/ray/thirdparty_files/psutil/_psosx.py", line 15, in <module>
-      from . import _psutil_osx as cext
-  ImportError: cannot import name '_psutil_osx' from partially initialized module 'psutil' (most likely due to a circular import) (.../ray/python/ray/thirdparty_files/psutil/__init__.py)
-
-Then you should run the following commands:
-
-.. code-block:: bash
-
-  rm -rf python/ray/thirdparty_files/
-  python3 -m pip install setproctitle
