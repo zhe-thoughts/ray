@@ -1,11 +1,11 @@
-base_image: "anyscale/ray:nightly-py37"
+base_image: {{ env["RAY_IMAGE_NIGHTLY_CPU"] | default("anyscale/ray:nightly-py37") }}
 debian_packages: []
 
 python:
   pip_packages:
     - terminado
     - boto3
-    - cython==0.29.0
+    - cython==0.29.26
   conda_packages: []
 
 post_build_cmds:

@@ -1,4 +1,4 @@
-base_image: "anyscale/ray:nightly-py37"
+base_image: {{ env["RAY_IMAGE_NIGHTLY_CPU"] | default("anyscale/ray:nightly-py37") }}
 env_vars: {}
 debian_packages:
   - curl
@@ -8,6 +8,7 @@ python:
     - pytest
     - awscli
     - xgboost_ray
+    - pyarrow>=6.0.1,<7.0.0
   conda_packages: []
 
 post_build_cmds:

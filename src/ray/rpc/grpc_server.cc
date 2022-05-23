@@ -24,20 +24,13 @@
 #include "ray/stats/metric.h"
 #include "ray/util/util.h"
 
-DEFINE_stats(grpc_server_req_process_time_ms, "Request latency in grpc server",
-             ("Method"), (), ray::stats::GAUGE);
-DEFINE_stats(grpc_server_req_new, "New request number in grpc server", ("Method"), (),
-             ray::stats::COUNT);
-DEFINE_stats(grpc_server_req_handling, "Request number are handling in grpc server",
-             ("Method"), (), ray::stats::COUNT);
-DEFINE_stats(grpc_server_req_finished, "Finished request number in grpc server",
-             ("Method"), (), ray::stats::COUNT);
-
 namespace ray {
 namespace rpc {
 
-GrpcServer::GrpcServer(std::string name, const uint32_t port,
-                       bool listen_to_localhost_only, int num_threads,
+GrpcServer::GrpcServer(std::string name,
+                       const uint32_t port,
+                       bool listen_to_localhost_only,
+                       int num_threads,
                        int64_t keepalive_time_ms)
     : name_(std::move(name)),
       port_(port),
@@ -106,7 +99,7 @@ void GrpcServer::Run() {
       << "it indicates the server fails to start because the port is already used by "
       << "other processes (such as --node-manager-port, --object-manager-port, "
       << "--gcs-server-port, and ports between --min-worker-port, --max-worker-port). "
-      << "Try running lsof -i :" << specified_port
+      << "Try running sudo lsof -i :" << specified_port
       << " to check if there are other processes listening to the port.";
   RAY_CHECK(port_ > 0);
   RAY_LOG(INFO) << name_ << " server started, listening on port " << port_ << ".";
@@ -132,6 +125,10 @@ void GrpcServer::Run() {
   }
   // Set the server as running.
   is_closed_ = false;
+}
+
+void GrpcServer::RegisterService(grpc::Service &service) {
+  services_.emplace_back(service);
 }
 
 void GrpcServer::RegisterService(GrpcService &service) {
@@ -178,15 +175,18 @@ void GrpcServer::PollEventsFromCompletionQueue(int index) {
       // `ok == false` will occur in two situations:
 
       // First, server has sent reply to client and failed, the server call's status is
-      // SENDING_REPLY.
+      // SENDING_REPLY. This can happen, for example, when the client deadline has
+      // exceeded or the client side is dead.
       if (server_call->GetState() == ServerCallState::SENDING_REPLY) {
         server_call->OnReplyFailed();
         // A new call should be suplied.
         need_new_call = true;
       }
-
       // Second, the server has been shut down, the server call's status is PENDING.
       // And don't need to do anything other than deleting this call.
+      // See
+      // https://grpc.github.io/grpc/cpp/classgrpc_1_1_completion_queue.html#a86d9810ced694e50f7987ac90b9f8c1a
+      // for more details.
       delete_call = true;
     }
     if (delete_call) {

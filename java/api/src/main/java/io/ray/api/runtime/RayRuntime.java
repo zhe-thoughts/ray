@@ -10,18 +10,20 @@ import io.ray.api.function.PyActorClass;
 import io.ray.api.function.PyActorMethod;
 import io.ray.api.function.PyFunction;
 import io.ray.api.function.RayFunc;
+import io.ray.api.function.RayFuncR;
 import io.ray.api.id.ActorId;
 import io.ray.api.id.PlacementGroupId;
 import io.ray.api.options.ActorCreationOptions;
 import io.ray.api.options.CallOptions;
 import io.ray.api.options.PlacementGroupCreationOptions;
+import io.ray.api.parallelactor.ParallelActorContext;
 import io.ray.api.placementgroup.PlacementGroup;
 import io.ray.api.runtimecontext.ResourceValue;
 import io.ray.api.runtimecontext.RuntimeContext;
+import io.ray.api.runtimeenv.RuntimeEnv;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.Callable;
 
 /** Base interface of a Ray runtime. */
 public interface RayRuntime {
@@ -72,6 +74,7 @@ public interface RayRuntime {
    * @param objectRef The reference of the object to get.
    * @param timeoutMs The maximum amount of time in millseconds to wait before returning.
    * @return The Java object.
+   * @throws RayTimeoutException If it's timeout to get the object.
    */
   <T> T get(ObjectRef<T> objectRef, long timeoutMs);
 
@@ -81,6 +84,7 @@ public interface RayRuntime {
    * @param objectRefs The list of object references.
    * @param timeoutMs The maximum amount of time in millseconds to wait before returning.
    * @return A list of Java objects.
+   * @throws RayTimeoutException If it's timeout to get the object.
    */
   <T> List<T> get(List<ObjectRef<T>> objectRefs, long timeoutMs);
 
@@ -202,26 +206,6 @@ public interface RayRuntime {
 
   RuntimeContext getRuntimeContext();
 
-  Object getAsyncContext();
-
-  void setAsyncContext(Object asyncContext);
-
-  /**
-   * Wrap a {@link Runnable} with necessary context capture.
-   *
-   * @param runnable The runnable to wrap.
-   * @return The wrapped runnable.
-   */
-  Runnable wrapRunnable(Runnable runnable);
-
-  /**
-   * Wrap a {@link Callable} with necessary context capture.
-   *
-   * @param callable The callable to wrap.
-   * @return The wrapped callable.
-   */
-  <T> Callable<T> wrapCallable(Callable<T> callable);
-
   /** Intentionally exit the current actor. */
   void exitActor();
 
@@ -277,4 +261,12 @@ public interface RayRuntime {
 
   /** Create concurrency group instance at runtime. */
   ConcurrencyGroup createConcurrencyGroup(String name, int maxConcurrency, List<RayFunc> funcs);
+
+  List<ConcurrencyGroup> extractConcurrencyGroups(RayFuncR<?> actorConstructorLambda);
+
+  /** Create runtime env instance at runtime. */
+  RuntimeEnv createRuntimeEnv(Map<String, String> envVars, List<String> jars);
+
+  /// Get the parallel actor context at runtime.
+  ParallelActorContext getParallelActorContext();
 }
