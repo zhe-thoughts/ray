@@ -5,13 +5,20 @@ import os
 import uuid
 from typing import Dict, List, Optional, Union
 import warnings
+import numpy as np
 
 from ray.tune.error import TuneError
 from ray.tune.experiment import Experiment, convert_to_experiment_list
 from ray.tune.config_parser import make_parser, create_trial_from_spec
+from ray.tune.sample import np_random_generator, _BackwardsCompatibleNumpyRng
 from ray.tune.suggest.variant_generator import (
-    count_variants, count_spec_samples, generate_variants, format_vars,
-    flatten_resolved_vars, get_preset_variants)
+    count_variants,
+    count_spec_samples,
+    generate_variants,
+    format_vars,
+    flatten_resolved_vars,
+    get_preset_variants,
+)
 from ray.tune.suggest.search import SearchAlgorithm
 from ray.tune.utils.util import atomic_save, load_newest_checkpoint
 
@@ -59,38 +66,53 @@ class _TrialIterator:
     """Generates trials from the spec.
 
     Args:
-        uuid_prefix (str): Used in creating the trial name.
-        num_samples (int): Number of samples from distribution
+        uuid_prefix: Used in creating the trial name.
+        num_samples: Number of samples from distribution
              (same as tune.run).
-        unresolved_spec (dict): Experiment specification
+        unresolved_spec: Experiment specification
             that might have unresolved distributions.
-        output_path (str): A specific output path within the local_dir.
-        points_to_evaluate (list): Same as tune.run.
-        lazy_eval (bool): Whether variants should be generated
+        constant_grid_search: Should random variables be sampled
+            first before iterating over grid variants (True) or not (False).
+        output_path: A specific output path within the local_dir.
+        points_to_evaluate: Same as tune.run.
+        lazy_eval: Whether variants should be generated
             lazily or eagerly. This is toggled depending
             on the size of the grid search.
-        start (int): index at which to start counting trials.
+        start: index at which to start counting trials.
+        random_state (int | np.random.Generator | np.random.RandomState):
+            Seed or numpy random generator to use for reproducible results.
+            If None (default), will use the global numpy random generator
+            (``np.random``). Please note that full reproducibility cannot
+            be guaranteed in a distributed enviroment.
     """
 
-    def __init__(self,
-                 uuid_prefix: str,
-                 num_samples: int,
-                 unresolved_spec: dict,
-                 output_path: str = "",
-                 points_to_evaluate: Optional[List] = None,
-                 lazy_eval: bool = False,
-                 start: int = 0):
+    def __init__(
+        self,
+        uuid_prefix: str,
+        num_samples: int,
+        unresolved_spec: dict,
+        constant_grid_search: bool = False,
+        output_path: str = "",
+        points_to_evaluate: Optional[List] = None,
+        lazy_eval: bool = False,
+        start: int = 0,
+        random_state: Optional[
+            Union[int, "np_random_generator", np.random.RandomState]
+        ] = None,
+    ):
         self.parser = make_parser()
         self.num_samples = num_samples
         self.uuid_prefix = uuid_prefix
         self.num_samples_left = num_samples
         self.unresolved_spec = unresolved_spec
+        self.constant_grid_search = constant_grid_search
         self.output_path = output_path
         self.points_to_evaluate = points_to_evaluate or []
         self.num_points_to_evaluate = len(self.points_to_evaluate)
         self.counter = start
         self.lazy_eval = lazy_eval
         self.variants = None
+        self.random_state = random_state
 
     def create_trial(self, resolved_vars, spec):
         trial_id = self.uuid_prefix + ("%05d" % self.counter)
@@ -105,7 +127,8 @@ class _TrialIterator:
             self.parser,
             evaluated_params=flatten_resolved_vars(resolved_vars),
             trial_id=trial_id,
-            experiment_tag=experiment_tag)
+            experiment_tag=experiment_tag,
+        )
 
     def __next__(self):
         """Generates Trial objects with the variant generation process.
@@ -120,8 +143,7 @@ class _TrialIterator:
         """
 
         if "run" not in self.unresolved_spec:
-            raise TuneError("Must specify `run` in {}".format(
-                self.unresolved_spec))
+            raise TuneError("Must specify `run` in {}".format(self.unresolved_spec))
 
         if self.variants and self.variants.has_next():
             # This block will be skipped upon instantiation.
@@ -133,14 +155,25 @@ class _TrialIterator:
             config = self.points_to_evaluate.pop(0)
             self.num_samples_left -= 1
             self.variants = _VariantIterator(
-                get_preset_variants(self.unresolved_spec, config),
-                lazy_eval=self.lazy_eval)
+                get_preset_variants(
+                    self.unresolved_spec,
+                    config,
+                    constant_grid_search=self.constant_grid_search,
+                    random_state=self.random_state,
+                ),
+                lazy_eval=self.lazy_eval,
+            )
             resolved_vars, spec = next(self.variants)
             return self.create_trial(resolved_vars, spec)
         elif self.num_samples_left > 0:
             self.variants = _VariantIterator(
-                generate_variants(self.unresolved_spec),
-                lazy_eval=self.lazy_eval)
+                generate_variants(
+                    self.unresolved_spec,
+                    constant_grid_search=self.constant_grid_search,
+                    random_state=self.random_state,
+                ),
+                lazy_eval=self.lazy_eval,
+            )
             self.num_samples_left -= 1
             resolved_vars, spec = next(self.variants)
             return self.create_trial(resolved_vars, spec)
@@ -159,11 +192,23 @@ class BasicVariantGenerator(SearchAlgorithm):
 
 
     Args:
-        points_to_evaluate (list): Initial parameter suggestions to be run
+        points_to_evaluate: Initial parameter suggestions to be run
             first. This is for when you already have some good parameters
             you want to run first to help the algorithm make better suggestions
             for future parameters. Needs to be a list of dicts containing the
             configurations.
+        max_concurrent: Maximum number of concurrently running trials.
+            If 0 (default), no maximum is enforced.
+        constant_grid_search: If this is set to ``True``, Ray Tune will
+            *first* try to sample random values and keep them constant over
+            grid search parameters. If this is set to ``False`` (default),
+            Ray Tune will sample new random parameters in each grid search
+            condition.
+        random_state:
+            Seed or numpy random generator to use for reproducible results.
+            If None (default), will use the global numpy random generator
+            (``np.random``). Please note that full reproducibility cannot
+            be guaranteed in a distributed environment.
 
 
     Example:
@@ -226,13 +271,23 @@ class BasicVariantGenerator(SearchAlgorithm):
       both of these trials.
 
     """
+
     CKPT_FILE_TMPL = "basic-variant-state-{}.json"
 
-    def __init__(self, points_to_evaluate: Optional[List[Dict]] = None):
+    def __init__(
+        self,
+        points_to_evaluate: Optional[List[Dict]] = None,
+        max_concurrent: int = 0,
+        constant_grid_search: bool = False,
+        random_state: Optional[
+            Union[int, "np_random_generator", np.random.RandomState]
+        ] = None,
+    ):
         self._trial_generator = []
         self._iterators = []
         self._trial_iter = None
         self._finished = False
+        self._random_state = _BackwardsCompatibleNumpyRng(random_state)
 
         self._points_to_evaluate = points_to_evaluate or []
 
@@ -245,18 +300,21 @@ class BasicVariantGenerator(SearchAlgorithm):
             self._uuid_prefix = str(uuid.uuid1().hex)[:5] + "_"
 
         self._total_samples = 0
+        self.max_concurrent = max_concurrent
+        self._constant_grid_search = constant_grid_search
+        self._live_trials = set()
 
     @property
     def total_samples(self):
         return self._total_samples
 
     def add_configurations(
-            self,
-            experiments: Union[Experiment, List[Experiment], Dict[str, Dict]]):
+        self, experiments: Union[Experiment, List[Experiment], Dict[str, Dict]]
+    ):
         """Chains generator given experiment specifications.
 
         Arguments:
-            experiments (Experiment | list | dict): Experiments to run.
+            experiments: Experiments to run.
         """
         experiment_list = convert_to_experiment_list(experiments)
         for experiment in experiment_list:
@@ -268,23 +326,25 @@ class BasicVariantGenerator(SearchAlgorithm):
                     "exceeds the serialization threshold "
                     f"({int(SERIALIZATION_THRESHOLD)}). Resume ability is "
                     "disabled. To fix this, reduce the number of "
-                    "dimensions/size of the provided grid search.")
+                    "dimensions/size of the provided grid search."
+                )
 
             previous_samples = self._total_samples
             points_to_evaluate = copy.deepcopy(self._points_to_evaluate)
-            self._total_samples += count_variants(experiment.spec,
-                                                  points_to_evaluate)
+            self._total_samples += count_variants(experiment.spec, points_to_evaluate)
             iterator = _TrialIterator(
                 uuid_prefix=self._uuid_prefix,
                 num_samples=experiment.spec.get("num_samples", 1),
                 unresolved_spec=experiment.spec,
+                constant_grid_search=self._constant_grid_search,
                 output_path=experiment.dir_name,
                 points_to_evaluate=points_to_evaluate,
                 lazy_eval=lazy_eval,
-                start=previous_samples)
+                start=previous_samples,
+                random_state=self._random_state,
+            )
             self._iterators.append(iterator)
-            self._trial_generator = itertools.chain(self._trial_generator,
-                                                    iterator)
+            self._trial_generator = itertools.chain(self._trial_generator, iterator)
 
     def next_trial(self):
         """Provides one Trial object to be queued into the TrialRunner.
@@ -292,15 +352,27 @@ class BasicVariantGenerator(SearchAlgorithm):
         Returns:
             Trial: Returns a single trial.
         """
+        if self.is_finished():
+            return None
+        if self.max_concurrent > 0 and len(self._live_trials) >= self.max_concurrent:
+            return None
         if not self._trial_iter:
             self._trial_iter = iter(self._trial_generator)
         try:
-            return next(self._trial_iter)
+            trial = next(self._trial_iter)
+            self._live_trials.add(trial.trial_id)
+            return trial
         except StopIteration:
             self._trial_generator = []
             self._trial_iter = None
             self.set_finished()
             return None
+
+    def on_trial_complete(
+        self, trial_id: str, result: Optional[Dict] = None, error: bool = False
+    ):
+        if trial_id in self._live_trials:
+            self._live_trials.remove(trial_id)
 
     def get_state(self):
         if any(iterator.lazy_eval for iterator in self._iterators):
@@ -312,8 +384,7 @@ class BasicVariantGenerator(SearchAlgorithm):
     def set_state(self, state):
         self.__dict__.update(state)
         for iterator in self._iterators:
-            self._trial_generator = itertools.chain(self._trial_generator,
-                                                    iterator)
+            self._trial_generator = itertools.chain(self._trial_generator, iterator)
 
     def save_to_dir(self, dirpath, session_str):
         if any(iterator.lazy_eval for iterator in self._iterators):
@@ -323,18 +394,16 @@ class BasicVariantGenerator(SearchAlgorithm):
             state=state_dict,
             checkpoint_dir=dirpath,
             file_name=self.CKPT_FILE_TMPL.format(session_str),
-            tmp_file_name=".tmp_generator")
+            tmp_file_name=".tmp_generator",
+        )
 
     def has_checkpoint(self, dirpath: str):
         """Whether a checkpoint file exists within dirpath."""
-        return bool(
-            glob.glob(os.path.join(dirpath, self.CKPT_FILE_TMPL.format("*"))))
+        return bool(glob.glob(os.path.join(dirpath, self.CKPT_FILE_TMPL.format("*"))))
 
     def restore_from_dir(self, dirpath: str):
         """Restores self + searcher + search wrappers from dirpath."""
-        state_dict = load_newest_checkpoint(dirpath,
-                                            self.CKPT_FILE_TMPL.format("*"))
+        state_dict = load_newest_checkpoint(dirpath, self.CKPT_FILE_TMPL.format("*"))
         if not state_dict:
-            raise RuntimeError(
-                "Unable to find checkpoint in {}.".format(dirpath))
+            raise RuntimeError("Unable to find checkpoint in {}.".format(dirpath))
         self.set_state(state_dict)

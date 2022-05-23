@@ -22,11 +22,12 @@
 #include "opencensus/stats/internal/delta_producer.h"
 #include "opencensus/stats/stats.h"
 #include "opencensus/tags/tag_key.h"
+#include "ray/common/asio/instrumented_io_context.h"
+#include "ray/common/asio/io_service_pool.h"
 #include "ray/common/ray_config.h"
 #include "ray/stats/metric.h"
 #include "ray/stats/metric_exporter.h"
 #include "ray/stats/metric_exporter_client.h"
-#include "ray/util/io_service_pool.h"
 #include "ray/util/logging.h"
 
 namespace ray {
@@ -34,9 +35,6 @@ namespace ray {
 namespace stats {
 
 #include <boost/asio.hpp>
-
-/// Include metric_defs.h to define measure items.
-#include "ray/stats/metric_defs.h"
 
 // TODO(sang) Put all states and logic into a singleton class Stats.
 static std::shared_ptr<IOServicePool> metrics_io_service_pool;
@@ -54,7 +52,8 @@ static absl::Mutex stats_mutex;
 /// \param global_tags[in] Tags that will be appended to all metrics in this process.
 /// \param metrics_agent_port[in] The port to export metrics at each node.
 /// \param exporter_to_use[in] The exporter client you will use for this process' metrics.
-static inline void Init(const TagsType &global_tags, const int metrics_agent_port,
+static inline void Init(const TagsType &global_tags,
+                        const int metrics_agent_port,
                         std::shared_ptr<MetricExporterClient> exporter_to_use = nullptr,
                         int64_t metrics_report_batch_size =
                             RayConfig::instance().metrics_report_batch_size()) {
@@ -77,7 +76,7 @@ static inline void Init(const TagsType &global_tags, const int metrics_agent_por
 
   metrics_io_service_pool = std::make_shared<IOServicePool>(1);
   metrics_io_service_pool->Run();
-  boost::asio::io_service *metrics_io_service = metrics_io_service_pool->Get();
+  instrumented_io_context *metrics_io_service = metrics_io_service_pool->Get();
   RAY_CHECK(metrics_io_service != nullptr);
 
   // Default exporter is a metrics agent exporter.
@@ -96,13 +95,16 @@ static inline void Init(const TagsType &global_tags, const int metrics_agent_por
                                   static_cast<uint64_t>(500))));
 
   MetricPointExporter::Register(exporter, metrics_report_batch_size);
-  OpenCensusProtoExporter::Register(metrics_agent_port, (*metrics_io_service),
-                                    "127.0.0.1");
+  OpenCensusProtoExporter::Register(
+      metrics_agent_port, (*metrics_io_service), "127.0.0.1");
   opencensus::stats::StatsExporter::SetInterval(
       StatsConfig::instance().GetReportInterval());
   opencensus::stats::DeltaProducer::Get()->SetHarvestInterval(
       StatsConfig::instance().GetHarvestInterval());
   StatsConfig::instance().SetGlobalTags(global_tags);
+  for (auto &f : StatsConfig::instance().PopInitializers()) {
+    f();
+  }
   StatsConfig::instance().SetIsInitialized(true);
 }
 
@@ -121,6 +123,7 @@ static inline void Shutdown() {
   exporter = nullptr;
   StatsConfig::instance().SetIsInitialized(false);
 }
+
 }  // namespace stats
 
 }  // namespace ray

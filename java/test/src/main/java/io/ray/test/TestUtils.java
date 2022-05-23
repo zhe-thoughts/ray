@@ -3,12 +3,16 @@ package io.ray.test;
 import com.google.common.base.Preconditions;
 import io.ray.api.ObjectRef;
 import io.ray.api.Ray;
-import io.ray.runtime.AbstractRayRuntime;
 import io.ray.runtime.RayRuntimeInternal;
-import io.ray.runtime.RayRuntimeProxy;
+import io.ray.runtime.config.RayConfig;
 import io.ray.runtime.config.RunMode;
 import io.ray.runtime.task.ArgumentsBuilder;
 import java.io.Serializable;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.function.Supplier;
 import org.testng.Assert;
 
@@ -30,8 +34,48 @@ public class TestUtils {
 
   private static final int WAIT_INTERVAL_MS = 5;
 
-  public static boolean isSingleProcessMode() {
-    return getRuntime().getRayConfig().runMode == RunMode.SINGLE_PROCESS;
+  public static boolean isLocalMode() {
+    return getRuntime().getRayConfig().runMode == RunMode.LOCAL;
+  }
+
+  /**
+   * Assert that the given runnable finishes within given timeout.
+   *
+   * @param runnable A runnable that should finish within given timeout.
+   * @param timeoutMs Timeout in milliseconds.
+   */
+  public static void executeWithinTime(Runnable runnable, int timeoutMs) {
+    executeWithinTimeRange(runnable, 0, timeoutMs);
+  }
+
+  /**
+   * Assert that the given runnable finishes within given time range.
+   *
+   * @param runnable A runnable that should finish within given timeout.
+   * @param minTimeMs The minimum time for execution.
+   * @param maxTimeMs The maximum time for execution.
+   */
+  public static void executeWithinTimeRange(Runnable runnable, int minTimeMs, int maxTimeMs) {
+    Instant start = Instant.now();
+    runnable.run();
+    Instant end = Instant.now();
+    long duration = Duration.between(start, end).toMillis();
+    Assert.assertTrue(
+        duration >= minTimeMs,
+        "The given runnable didn't run for at least "
+            + minTimeMs
+            + "ms. "
+            + "Actual execution time: "
+            + duration
+            + " ms.");
+    Assert.assertTrue(
+        duration <= maxTimeMs,
+        "The given runnable didn't finish within "
+            + maxTimeMs
+            + "ms. "
+            + "Actual execution time: "
+            + duration
+            + " ms.");
   }
 
   /**
@@ -42,20 +86,19 @@ public class TestUtils {
    * @return True if the condition is met within the timeout, false otherwise.
    */
   public static boolean waitForCondition(Supplier<Boolean> condition, int timeoutMs) {
-    int waitTime = 0;
+    long endTime = System.currentTimeMillis() + timeoutMs;
     while (true) {
       if (condition.get()) {
         return true;
       }
 
+      if (System.currentTimeMillis() >= endTime) {
+        break;
+      }
       try {
         java.util.concurrent.TimeUnit.MILLISECONDS.sleep(WAIT_INTERVAL_MS);
       } catch (InterruptedException e) {
         throw new RuntimeException(e);
-      }
-      waitTime += WAIT_INTERVAL_MS;
-      if (waitTime > timeoutMs) {
-        break;
       }
     }
     return false;
@@ -84,19 +127,25 @@ public class TestUtils {
   }
 
   public static RayRuntimeInternal getUnderlyingRuntime() {
-    if (Ray.internal() instanceof AbstractRayRuntime) {
-      return (RayRuntimeInternal) Ray.internal();
+    return (RayRuntimeInternal) Ray.internal();
+  }
+
+  public static ProcessBuilder buildDriver(Class<?> mainClass, String[] args) {
+    RayConfig rayConfig = TestUtils.getRuntime().getRayConfig();
+
+    List<String> fullArgs = new ArrayList<>();
+    fullArgs.add("java");
+    fullArgs.add("-cp");
+    fullArgs.add(System.getProperty("java.class.path"));
+    fullArgs.add("-Dray.address=" + rayConfig.getBootstrapAddress());
+    fullArgs.add("-Dray.object-store.socket-name=" + rayConfig.objectStoreSocketName);
+    fullArgs.add("-Dray.raylet.socket-name=" + rayConfig.rayletSocketName);
+    fullArgs.add("-Dray.raylet.node-manager-port=" + rayConfig.getNodeManagerPort());
+    fullArgs.add(mainClass.getName());
+    if (args != null) {
+      fullArgs.addAll(Arrays.asList(args));
     }
-    RayRuntimeProxy proxy =
-        (RayRuntimeProxy) (java.lang.reflect.Proxy.getInvocationHandler(Ray.internal()));
-    return proxy.getRuntimeObject();
-  }
 
-  private static int getNumWorkersPerProcessRemoteFunction() {
-    return TestUtils.getRuntime().getRayConfig().numWorkersPerProcess;
-  }
-
-  public static int getNumWorkersPerProcess() {
-    return Ray.task(TestUtils::getNumWorkersPerProcessRemoteFunction).remote().get();
+    return new ProcessBuilder(fullArgs);
   }
 }

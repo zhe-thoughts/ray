@@ -1,6 +1,8 @@
 package io.ray.api.call;
 
 import io.ray.api.options.CallOptions;
+import io.ray.api.placementgroup.PlacementGroup;
+import io.ray.api.runtimeenv.RuntimeEnv;
 import java.util.Map;
 
 /**
@@ -47,6 +49,41 @@ public class BaseTaskCaller<T extends BaseTaskCaller<T>> {
    */
   public T setResources(Map<String, Double> resources) {
     builder.setResources(resources);
+    return self();
+  }
+
+  /**
+   * Set the placement group to place this task in.
+   *
+   * @param group The placement group of the task.
+   * @param bundleIndex The index of the bundle to place this task in.
+   * @return self
+   * @see CallOptions.Builder#setPlacementGroup(PlacementGroup, int)
+   */
+  public T setPlacementGroup(PlacementGroup group, int bundleIndex) {
+    builder.setPlacementGroup(group, bundleIndex);
+    return self();
+  }
+
+  /**
+   * Set the placement group to place this task in, which may use any available bundle.
+   *
+   * @param group The placement group of the task.
+   * @return self
+   * @see CallOptions.Builder#setPlacementGroup(PlacementGroup, int)
+   */
+  public T setPlacementGroup(PlacementGroup group) {
+    return setPlacementGroup(group, -1);
+  }
+
+  /**
+   * Set the runtime env for this task to run the task in a specific environment.
+   *
+   * @param runtimeEnv The runtime env of this task.
+   * @return self
+   */
+  public T setRuntimeEnv(RuntimeEnv runtimeEnv) {
+    builder.setRuntimeEnv(runtimeEnv);
     return self();
   }
 

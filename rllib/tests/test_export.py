@@ -5,24 +5,25 @@ import shutil
 import unittest
 
 import ray
-from ray.rllib.agents.registry import get_agent_class
+from ray.rllib.agents.registry import get_trainer_class
+from ray.rllib.utils.framework import try_import_tf
 from ray.tune.trial import ExportFormat
+
+tf1, tf, tfv = try_import_tf()
 
 CONFIGS = {
     "A3C": {
         "explore": False,
         "num_workers": 1,
-        "framework": "tf",
     },
     "APEX_DDPG": {
         "explore": False,
         "observation_filter": "MeanStdFilter",
         "num_workers": 2,
-        "min_iter_time_s": 1,
+        "min_time_s_per_reporting": 1,
         "optimizer": {
             "num_replay_buffer_shards": 1,
         },
-        "framework": "tf",
     },
     "ARS": {
         "explore": False,
@@ -30,16 +31,13 @@ CONFIGS = {
         "num_workers": 2,
         "noise_size": 2500000,
         "observation_filter": "MeanStdFilter",
-        "framework": "tf",
     },
     "DDPG": {
         "explore": False,
-        "timesteps_per_iteration": 100,
-        "framework": "tf",
+        "min_sample_timesteps_per_reporting": 100,
     },
     "DQN": {
         "explore": False,
-        "framework": "tf",
     },
     "ES": {
         "explore": False,
@@ -48,80 +46,108 @@ CONFIGS = {
         "num_workers": 2,
         "noise_size": 2500000,
         "observation_filter": "MeanStdFilter",
-        "framework": "tf",
     },
     "PPO": {
         "explore": False,
         "num_sgd_iter": 5,
         "train_batch_size": 1000,
         "num_workers": 2,
-        "framework": "tf",
     },
     "SAC": {
         "explore": False,
-        "framework": "tf",
     },
 }
 
 
-def export_test(alg_name, failures):
+def export_test(alg_name, failures, framework="tf"):
     def valid_tf_model(model_dir):
-        return os.path.exists(os.path.join(model_dir, "saved_model.pb")) \
-            and os.listdir(os.path.join(model_dir, "variables"))
+        return os.path.exists(os.path.join(model_dir, "saved_model.pb")) and os.listdir(
+            os.path.join(model_dir, "variables")
+        )
 
     def valid_tf_checkpoint(checkpoint_dir):
-        return os.path.exists(os.path.join(checkpoint_dir, "model.meta")) \
-            and os.path.exists(os.path.join(checkpoint_dir, "model.index")) \
+        return (
+            os.path.exists(os.path.join(checkpoint_dir, "model.meta"))
+            and os.path.exists(os.path.join(checkpoint_dir, "model.index"))
             and os.path.exists(os.path.join(checkpoint_dir, "checkpoint"))
+        )
 
-    cls = get_agent_class(alg_name)
+    cls = get_trainer_class(alg_name)
+    config = CONFIGS[alg_name].copy()
+    config["framework"] = framework
     if "DDPG" in alg_name or "SAC" in alg_name:
-        algo = cls(config=CONFIGS[alg_name], env="Pendulum-v0")
+        algo = cls(config=config, env="Pendulum-v1")
     else:
-        algo = cls(config=CONFIGS[alg_name], env="CartPole-v0")
+        algo = cls(config=config, env="CartPole-v0")
 
     for _ in range(1):
         res = algo.train()
         print("current status: " + str(res))
 
-    export_dir = os.path.join(ray.utils.get_user_temp_dir(),
-                              "export_dir_%s" % alg_name)
+    export_dir = os.path.join(
+        ray._private.utils.get_user_temp_dir(), "export_dir_%s" % alg_name
+    )
     print("Exporting model ", alg_name, export_dir)
     algo.export_policy_model(export_dir)
-    if not valid_tf_model(export_dir):
+    if framework == "tf" and not valid_tf_model(export_dir):
         failures.append(alg_name)
     shutil.rmtree(export_dir)
 
-    print("Exporting checkpoint", alg_name, export_dir)
-    algo.export_policy_checkpoint(export_dir)
-    if not valid_tf_checkpoint(export_dir):
-        failures.append(alg_name)
-    shutil.rmtree(export_dir)
+    if framework == "tf":
+        print("Exporting checkpoint", alg_name, export_dir)
+        algo.export_policy_checkpoint(export_dir)
+        if framework == "tf" and not valid_tf_checkpoint(export_dir):
+            failures.append(alg_name)
+        shutil.rmtree(export_dir)
 
-    print("Exporting default policy", alg_name, export_dir)
-    algo.export_model([ExportFormat.CHECKPOINT, ExportFormat.MODEL],
-                      export_dir)
-    if not valid_tf_model(os.path.join(export_dir, ExportFormat.MODEL)) \
-            or not valid_tf_checkpoint(os.path.join(export_dir,
-                                                    ExportFormat.CHECKPOINT)):
-        failures.append(alg_name)
-    shutil.rmtree(export_dir)
+        print("Exporting default policy", alg_name, export_dir)
+        algo.export_model([ExportFormat.CHECKPOINT, ExportFormat.MODEL], export_dir)
+        if not valid_tf_model(
+            os.path.join(export_dir, ExportFormat.MODEL)
+        ) or not valid_tf_checkpoint(os.path.join(export_dir, ExportFormat.CHECKPOINT)):
+            failures.append(alg_name)
+
+        # Test loading the exported model.
+        model = tf.saved_model.load(os.path.join(export_dir, ExportFormat.MODEL))
+        assert model
+
+        shutil.rmtree(export_dir)
+    algo.stop()
 
 
 class TestExport(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        ray.init(
-            num_cpus=10, object_store_memory=1e9, ignore_reinit_error=True)
+        ray.init(num_cpus=4)
 
     @classmethod
     def tearDownClass(cls) -> None:
         ray.shutdown()
 
-    def test_export(self):
+    def test_export_a3c(self):
         failures = []
-        for name in ["A3C", "DQN", "DDPG", "PPO", "SAC"]:
-            export_test(name, failures)
+        export_test("A3C", failures, "tf")
+        assert not failures, failures
+
+    def test_export_ddpg(self):
+        failures = []
+        export_test("DDPG", failures, "tf")
+        assert not failures, failures
+
+    def test_export_dqn(self):
+        failures = []
+        export_test("DQN", failures, "tf")
+        assert not failures, failures
+
+    def test_export_ppo(self):
+        failures = []
+        export_test("PPO", failures, "torch")
+        export_test("PPO", failures, "tf")
+        assert not failures, failures
+
+    def test_export_sac(self):
+        failures = []
+        export_test("SAC", failures, "tf")
         assert not failures, failures
         print("All export tests passed!")
 
@@ -129,4 +155,5 @@ class TestExport(unittest.TestCase):
 if __name__ == "__main__":
     import pytest
     import sys
+
     sys.exit(pytest.main(["-v", __file__]))

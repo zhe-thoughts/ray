@@ -4,7 +4,7 @@ This example shows:
   - using a custom environment with Repeated / struct observations
   - using a custom model to view the batched list observations
 
-For PyTorch / TF eager mode, use the --torch and --eager flags.
+For PyTorch / TF eager mode, use the `--framework=[torch|tf2|tfe]` flag.
 """
 
 import argparse
@@ -14,12 +14,18 @@ import ray
 from ray import tune
 from ray.rllib.models import ModelCatalog
 from ray.rllib.examples.env.simple_rpg import SimpleRPG
-from ray.rllib.examples.models.simple_rpg_model import CustomTorchRPGModel, \
-    CustomTFRPGModel
+from ray.rllib.examples.models.simple_rpg_model import (
+    CustomTorchRPGModel,
+    CustomTFRPGModel,
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--framework", choices=["tf2", "tf", "tfe", "torch"], default="tf2")
+    "--framework",
+    choices=["tf", "tf2", "tfe", "torch"],
+    default="tf2",
+    help="The DL framework specifier.",
+)
 
 if __name__ == "__main__":
     ray.init()
@@ -40,6 +46,7 @@ if __name__ == "__main__":
         "model": {
             "custom_model": "my_model",
         },
+        "_disable_preprocessor_api": False,
     }
 
     stop = {

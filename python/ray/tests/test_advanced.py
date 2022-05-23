@@ -1,20 +1,21 @@
 # coding: utf-8
-from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
-import random
 import sys
-import threading
 import time
 
+import os
 import numpy as np
 import pytest
 
 import ray.cluster_utils
-import ray.test_utils
 
-from ray.test_utils import client_test_enabled
-from ray.test_utils import RayTestTimeoutException
+import ray._private.profiling as profiling
+from ray._private.test_utils import (
+    client_test_enabled,
+    RayTestTimeoutException,
+)
+from ray.exceptions import ReferenceCountingAssertionError
 
 if client_test_enabled():
     from ray.util.client import ray
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 # issue https://github.com/ray-project/ray/issues/7105
-@pytest.mark.skipif(client_test_enabled(), reason="message size")
+@pytest.mark.skipif(client_test_enabled(), reason="internal api")
 def test_internal_free(shutdown_only):
     ray.init(num_cpus=1)
 
@@ -43,7 +44,7 @@ def test_internal_free(shutdown_only):
     obj_ref = sampler.sample.remote()
     ray.get(obj_ref)
     ray.internal.free(obj_ref)
-    with pytest.raises(Exception):
+    with pytest.raises(ReferenceCountingAssertionError):
         ray.get(obj_ref)
 
     # Free deletes big objects from plasma store.
@@ -51,7 +52,7 @@ def test_internal_free(shutdown_only):
     ray.get(big_id)
     ray.internal.free(big_id)
     time.sleep(1)  # wait for delete RPC to propagate
-    with pytest.raises(Exception):
+    with pytest.raises(ReferenceCountingAssertionError):
         ray.get(big_id)
 
 
@@ -145,6 +146,11 @@ def test_running_function_on_all_workers(ray_start_regular):
 
     assert "fake_directory" == ray.get(get_path1.remote())[-1]
 
+    # the function should only run on the current driver once.
+    assert sys.path[-1] == "fake_directory"
+    if len(sys.path) > 1:
+        assert sys.path[-2] != "fake_directory"
+
     def f(worker_info):
         sys.path.pop(-1)
 
@@ -160,17 +166,31 @@ def test_running_function_on_all_workers(ray_start_regular):
     assert "fake_directory" not in ray.get(get_path2.remote())
 
 
-@pytest.mark.skipif(client_test_enabled(), reason="ray.timeline")
+@pytest.mark.skipif(
+    "RAY_PROFILING" not in os.environ, reason="Only tested in client/profiling build."
+)
+@pytest.mark.skipif(
+    client_test_enabled(),
+    reason=(
+        "wait_for_function will miss in this mode. To be fixed after using"
+        " gcs to bootstrap all component."
+    ),
+)
 def test_profiling_api(ray_start_2_cpus):
     @ray.remote
-    def f():
-        with ray.profile("custom_event", extra_data={"name": "custom name"}):
+    def f(delay):
+        with profiling.profile("custom_event", extra_data={"name": "custom name"}):
+            time.sleep(delay)
             pass
 
+    @ray.remote
+    def g(input_list):
+        # The argument input_list should be a list containing one object ref.
+        ray.wait([input_list[0]])
+
     ray.put(1)
-    object_ref = f.remote()
-    ray.wait([object_ref])
-    ray.get(object_ref)
+    x = f.remote(1)
+    ray.get([g.remote([x]), g.remote([x])])
 
     # Wait until all of the profiling information appears in the profile
     # table.
@@ -195,22 +215,23 @@ def test_profiling_api(ray_start_2_cpus):
             "custom_event",  # This is the custom one from ray.profile.
         ]
 
-        if all(expected_type in event_types
-               for expected_type in expected_types):
+        if all(expected_type in event_types for expected_type in expected_types):
             break
 
         if time.time() - start_time > timeout_seconds:
             raise RayTestTimeoutException(
                 "Timed out while waiting for information in "
                 "profile table. Missing events: {}.".format(
-                    set(expected_types) - set(event_types)))
+                    set(expected_types) - set(event_types)
+                )
+            )
 
         # The profiling information only flushes once every second.
         time.sleep(1.1)
 
 
-def test_wait_cluster(ray_start_cluster):
-    cluster = ray_start_cluster
+def test_wait_cluster(ray_start_cluster_enabled):
+    cluster = ray_start_cluster_enabled
     cluster.add_node(num_cpus=1, resources={"RemoteResource": 1})
     cluster.add_node(num_cpus=1, resources={"RemoteResource": 1})
     ray.init(address=cluster.address)
@@ -236,12 +257,12 @@ def test_wait_cluster(ray_start_cluster):
 
 
 @pytest.mark.skip(reason="TODO(ekl)")
-def test_object_transfer_dump(ray_start_cluster):
-    cluster = ray_start_cluster
+def test_object_transfer_dump(ray_start_cluster_enabled):
+    cluster = ray_start_cluster_enabled
 
     num_nodes = 3
     for i in range(num_nodes):
-        cluster.add_node(resources={str(i): 1}, object_store_memory=10**9)
+        cluster.add_node(resources={str(i): 1}, object_store_memory=10 ** 9)
     ray.init(address=cluster.address)
 
     @ray.remote
@@ -249,32 +270,44 @@ def test_object_transfer_dump(ray_start_cluster):
         return
 
     # These objects will live on different nodes.
-    object_refs = [
-        f._remote(args=[1], resources={str(i): 1}) for i in range(num_nodes)
-    ]
+    object_refs = [f._remote(args=[1], resources={str(i): 1}) for i in range(num_nodes)]
 
     # Broadcast each object from each machine to each other machine.
     for object_ref in object_refs:
-        ray.get([
-            f._remote(args=[object_ref], resources={str(i): 1})
-            for i in range(num_nodes)
-        ])
+        ray.get(
+            [
+                f._remote(args=[object_ref], resources={str(i): 1})
+                for i in range(num_nodes)
+            ]
+        )
 
     # The profiling information only flushes once every second.
     time.sleep(1.1)
 
-    transfer_dump = ray.object_transfer_timeline()
+    transfer_dump = ray.state.object_transfer_timeline()
     # Make sure the transfer dump can be serialized with JSON.
     json.loads(json.dumps(transfer_dump))
-    assert len(transfer_dump) >= num_nodes**2
-    assert len({
-        event["pid"]
-        for event in transfer_dump if event["name"] == "transfer_receive"
-    }) == num_nodes
-    assert len({
-        event["pid"]
-        for event in transfer_dump if event["name"] == "transfer_send"
-    }) == num_nodes
+    assert len(transfer_dump) >= num_nodes ** 2
+    assert (
+        len(
+            {
+                event["pid"]
+                for event in transfer_dump
+                if event["name"] == "transfer_receive"
+            }
+        )
+        == num_nodes
+    )
+    assert (
+        len(
+            {
+                event["pid"]
+                for event in transfer_dump
+                if event["name"] == "transfer_send"
+            }
+        )
+        == num_nodes
+    )
 
 
 def test_identical_function_names(ray_start_regular):
@@ -354,173 +387,7 @@ def test_illegal_api_calls(ray_start_regular):
         ray.get(3)
 
 
-@pytest.mark.skipif(
-    client_test_enabled(), reason="grpc interaction with releasing resources")
-def test_multithreading(ray_start_2_cpus):
-    # This test requires at least 2 CPUs to finish since the worker does not
-    # release resources when joining the threads.
-
-    def run_test_in_multi_threads(test_case, num_threads=10, num_repeats=25):
-        """A helper function that runs test cases in multiple threads."""
-
-        def wrapper():
-            for _ in range(num_repeats):
-                test_case()
-                time.sleep(random.randint(0, 10) / 1000.0)
-            return "ok"
-
-        executor = ThreadPoolExecutor(max_workers=num_threads)
-        futures = [executor.submit(wrapper) for _ in range(num_threads)]
-        for future in futures:
-            assert future.result() == "ok"
-
-    @ray.remote
-    def echo(value, delay_ms=0):
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
-        return value
-
-    def test_api_in_multi_threads():
-        """Test using Ray api in multiple threads."""
-
-        @ray.remote
-        class Echo:
-            def echo(self, value):
-                return value
-
-        # Test calling remote functions in multiple threads.
-        def test_remote_call():
-            value = random.randint(0, 1000000)
-            result = ray.get(echo.remote(value))
-            assert value == result
-
-        run_test_in_multi_threads(test_remote_call)
-
-        # Test multiple threads calling one actor.
-        actor = Echo.remote()
-
-        def test_call_actor():
-            value = random.randint(0, 1000000)
-            result = ray.get(actor.echo.remote(value))
-            assert value == result
-
-        run_test_in_multi_threads(test_call_actor)
-
-        # Test put and get.
-        def test_put_and_get():
-            value = random.randint(0, 1000000)
-            result = ray.get(ray.put(value))
-            assert value == result
-
-        run_test_in_multi_threads(test_put_and_get)
-
-        # Test multiple threads waiting for objects.
-        num_wait_objects = 10
-        objects = [
-            echo.remote(i, delay_ms=10) for i in range(num_wait_objects)
-        ]
-
-        def test_wait():
-            ready, _ = ray.wait(
-                objects,
-                num_returns=len(objects),
-                timeout=1000.0,
-            )
-            assert len(ready) == num_wait_objects
-            assert ray.get(ready) == list(range(num_wait_objects))
-
-        run_test_in_multi_threads(test_wait, num_repeats=1)
-
-    # Run tests in a driver.
-    test_api_in_multi_threads()
-
-    # Run tests in a worker.
-    @ray.remote
-    def run_tests_in_worker():
-        test_api_in_multi_threads()
-        return "ok"
-
-    assert ray.get(run_tests_in_worker.remote()) == "ok"
-
-    # Test actor that runs background threads.
-    @ray.remote
-    class MultithreadedActor:
-        def __init__(self):
-            self.lock = threading.Lock()
-            self.thread_results = []
-
-        def background_thread(self, wait_objects):
-            try:
-                # Test wait
-                ready, _ = ray.wait(
-                    wait_objects,
-                    num_returns=len(wait_objects),
-                    timeout=1000.0,
-                )
-                assert len(ready) == len(wait_objects)
-                for _ in range(20):
-                    num = 10
-                    # Test remote call
-                    results = [echo.remote(i) for i in range(num)]
-                    assert ray.get(results) == list(range(num))
-                    # Test put and get
-                    objects = [ray.put(i) for i in range(num)]
-                    assert ray.get(objects) == list(range(num))
-                    time.sleep(random.randint(0, 10) / 1000.0)
-            except Exception as e:
-                with self.lock:
-                    self.thread_results.append(e)
-            else:
-                with self.lock:
-                    self.thread_results.append("ok")
-
-        def spawn(self):
-            wait_objects = [echo.remote(i, delay_ms=10) for i in range(10)]
-            self.threads = [
-                threading.Thread(
-                    target=self.background_thread, args=(wait_objects, ))
-                for _ in range(20)
-            ]
-            [thread.start() for thread in self.threads]
-
-        def join(self):
-            [thread.join() for thread in self.threads]
-            assert self.thread_results == ["ok"] * len(self.threads)
-            return "ok"
-
-    actor = MultithreadedActor.remote()
-    actor.spawn.remote()
-    ray.get(actor.join.remote()) == "ok"
-
-
-@pytest.mark.skipif(client_test_enabled(), reason="message size")
-def test_wait_makes_object_local(ray_start_cluster):
-    cluster = ray_start_cluster
-    cluster.add_node(num_cpus=0)
-    cluster.add_node(num_cpus=2)
-    ray.init(address=cluster.address)
-
-    @ray.remote
-    class Foo:
-        def method(self):
-            return np.zeros(1024 * 1024)
-
-    a = Foo.remote()
-
-    # Test get makes the object local.
-    x_id = a.method.remote()
-    assert not ray.worker.global_worker.core_worker.object_exists(x_id)
-    ray.get(x_id)
-    assert ray.worker.global_worker.core_worker.object_exists(x_id)
-
-    # Test wait makes the object local.
-    x_id = a.method.remote()
-    assert not ray.worker.global_worker.core_worker.object_exists(x_id)
-    ok, _ = ray.wait([x_id])
-    assert len(ok) == 1
-    assert ray.worker.global_worker.core_worker.object_exists(x_id)
-
-
 if __name__ == "__main__":
     import pytest
+
     sys.exit(pytest.main(["-v", __file__]))

@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import sys
 import time
 
@@ -7,6 +8,7 @@ import numpy as np
 import pytest
 
 import ray
+from ray._private.test_utils import wait_for_condition
 
 
 @pytest.fixture
@@ -101,23 +103,60 @@ def test_wait_mixup(init):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "ray_start_regular_shared", [{
-        "object_store_memory": 100 * 1024 * 1024,
-    }],
-    indirect=True)
+    "ray_start_regular_shared",
+    [
+        {
+            "object_store_memory": 100 * 1024 * 1024,
+        }
+    ],
+    indirect=True,
+)
 async def test_garbage_collection(ray_start_regular_shared):
     # This is a regression test for
     # https://github.com/ray-project/ray/issues/9134
 
     @ray.remote
     def f():
-        return np.zeros(40 * 1024 * 1024, dtype=np.uint8)
+        return np.zeros(20 * 1024 * 1024, dtype=np.uint8)
 
     for _ in range(10):
         await f.remote()
     for _ in range(10):
-        put_id = ray.put(np.zeros(40 * 1024 * 1024, dtype=np.uint8))
+        put_id = ray.put(np.zeros(20 * 1024 * 1024, dtype=np.uint8))
         await put_id
+
+
+def test_concurrent_future(ray_start_regular_shared):
+    ref = ray.put(1)
+
+    fut = ref.future()
+    assert isinstance(fut, concurrent.futures.Future)
+    wait_for_condition(lambda: fut.done())
+
+    global_result = None
+
+    def cb(fut):
+        nonlocal global_result
+        global_result = fut.result()
+
+    fut.add_done_callback(cb)
+    assert global_result == 1
+    assert fut.result() == 1
+
+
+def test_concurrent_future_many(ray_start_regular_shared):
+    @ray.remote
+    def task(i):
+        return i
+
+    refs = [task.remote(i) for i in range(100)]
+    futs = [ref.future() for ref in refs]
+    result = set()
+
+    for fut in concurrent.futures.as_completed(futs):
+        assert fut.done()
+        result.add(fut.result())
+    assert result == set(range(100))
 
 
 if __name__ == "__main__":

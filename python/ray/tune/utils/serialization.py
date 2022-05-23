@@ -3,7 +3,7 @@ import logging
 import types
 
 from ray import cloudpickle as cloudpickle
-from ray.utils import binary_to_hex, hex_to_binary
+from ray._private.utils import binary_to_hex, hex_to_binary
 from ray.util.debug import log_once
 
 logger = logging.getLogger(__name__)
@@ -23,14 +23,13 @@ class TuneFunctionEncoder(json.JSONEncoder):
     def _to_cloudpickle(self, obj):
         return {
             "_type": "CLOUDPICKLE_FALLBACK",
-            "value": binary_to_hex(cloudpickle.dumps(obj))
+            "value": binary_to_hex(cloudpickle.dumps(obj)),
         }
 
 
 class TuneFunctionDecoder(json.JSONDecoder):
     def __init__(self, *args, **kwargs):
-        json.JSONDecoder.__init__(
-            self, object_hook=self.object_hook, *args, **kwargs)
+        json.JSONDecoder.__init__(self, object_hook=self.object_hook, *args, **kwargs)
 
     def object_hook(self, obj):
         if obj.get("_type") == "CLOUDPICKLE_FALLBACK":

@@ -1,17 +1,48 @@
+import collections
 import logging
 import numpy as np
-import collections
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 import ray
-from ray.rllib.evaluation.rollout_metrics import RolloutMetrics
-from ray.rllib.policy.sample_batch import DEFAULT_POLICY_ID
+from ray import ObjectRef
+from ray.actor import ActorHandle
 from ray.rllib.offline.off_policy_estimator import OffPolicyEstimate
-from ray.rllib.policy.policy import LEARNER_STATS_KEY
+from ray.rllib.policy.sample_batch import DEFAULT_POLICY_ID
 from ray.rllib.utils.annotations import DeveloperAPI
+from ray.rllib.utils.metrics.learner_info import LEARNER_STATS_KEY
 from ray.rllib.utils.typing import GradInfoDict, LearnerStatsDict, ResultDict
 
+if TYPE_CHECKING:
+    from ray.rllib.evaluation.rollout_worker import RolloutWorker
+
 logger = logging.getLogger(__name__)
+
+RolloutMetrics = collections.namedtuple(
+    "RolloutMetrics",
+    [
+        "episode_length",
+        "episode_reward",
+        "agent_rewards",
+        "custom_metrics",
+        "perf_stats",
+        "hist_data",
+        "media",
+    ],
+)
+RolloutMetrics.__new__.__defaults__ = (0, 0, {}, {}, {}, {}, {})
+
+
+def extract_stats(stats: Dict, key: str) -> Dict[str, Any]:
+    if key in stats:
+        return stats[key]
+
+    multiagent_stats = {}
+    for k, v in stats.items():
+        if isinstance(v, dict):
+            if key in v:
+                multiagent_stats[k] = v[key]
+
+    return multiagent_stats
 
 
 @DeveloperAPI
@@ -24,7 +55,6 @@ def get_learner_stats(grad_info: GradInfoDict) -> LearnerStatsDict:
         >>> print(get_stats(grad_info))
         {"vf_loss": ..., "policy_loss": ...}
     """
-
     if LEARNER_STATS_KEY in grad_info:
         return grad_info[LEARNER_STATS_KEY]
 
@@ -38,40 +68,54 @@ def get_learner_stats(grad_info: GradInfoDict) -> LearnerStatsDict:
 
 
 @DeveloperAPI
-def collect_metrics(local_worker: Optional["RolloutWorker"] = None,
-                    remote_workers: List["ActorHandle"] = [],
-                    to_be_collected: List["ObjectRef"] = [],
-                    timeout_seconds: int = 180) -> ResultDict:
+def collect_metrics(
+    local_worker: Optional["RolloutWorker"] = None,
+    remote_workers: Optional[List[ActorHandle]] = None,
+    to_be_collected: Optional[List[ObjectRef]] = None,
+    timeout_seconds: int = 180,
+    keep_custom_metrics: bool = False,
+) -> ResultDict:
     """Gathers episode metrics from RolloutWorker instances."""
+    if remote_workers is None:
+        remote_workers = []
+
+    if to_be_collected is None:
+        to_be_collected = []
 
     episodes, to_be_collected = collect_episodes(
-        local_worker,
-        remote_workers,
-        to_be_collected,
-        timeout_seconds=timeout_seconds)
-    metrics = summarize_episodes(episodes, episodes)
+        local_worker, remote_workers, to_be_collected, timeout_seconds=timeout_seconds
+    )
+    metrics = summarize_episodes(
+        episodes, episodes, keep_custom_metrics=keep_custom_metrics
+    )
     return metrics
 
 
 @DeveloperAPI
 def collect_episodes(
-        local_worker: Optional["RolloutWorker"] = None,
-        remote_workers: List["ActorHandle"] = [],
-        to_be_collected: List["ObjectRef"] = [],
-        timeout_seconds: int = 180
-) -> Tuple[List[Union[RolloutMetrics, OffPolicyEstimate]], List["ObjectRef"]]:
+    local_worker: Optional["RolloutWorker"] = None,
+    remote_workers: Optional[List[ActorHandle]] = None,
+    to_be_collected: Optional[List[ObjectRef]] = None,
+    timeout_seconds: int = 180,
+) -> Tuple[List[Union[RolloutMetrics, OffPolicyEstimate]], List[ObjectRef]]:
     """Gathers new episodes metrics tuples from the given evaluators."""
+    if remote_workers is None:
+        remote_workers = []
+
+    if to_be_collected is None:
+        to_be_collected = []
 
     if remote_workers:
         pending = [
             a.apply.remote(lambda ev: ev.get_metrics()) for a in remote_workers
         ] + to_be_collected
         collected, to_be_collected = ray.wait(
-            pending, num_returns=len(pending), timeout=timeout_seconds * 1.0)
+            pending, num_returns=len(pending), timeout=timeout_seconds * 1.0
+        )
         if pending and len(collected) == 0:
             logger.warning(
-                "WARNING: collected no metrics in {} seconds".format(
-                    timeout_seconds))
+                "WARNING: collected no metrics in {} seconds".format(timeout_seconds)
+            )
         metric_lists = ray.get(collected)
     else:
         metric_lists = []
@@ -86,8 +130,9 @@ def collect_episodes(
 
 @DeveloperAPI
 def summarize_episodes(
-        episodes: List[Union[RolloutMetrics, OffPolicyEstimate]],
-        new_episodes: List[Union[RolloutMetrics, OffPolicyEstimate]] = None
+    episodes: List[Union[RolloutMetrics, OffPolicyEstimate]],
+    new_episodes: List[Union[RolloutMetrics, OffPolicyEstimate]] = None,
+    keep_custom_metrics: bool = False,
 ) -> ResultDict:
     """Summarizes a set of episode metrics tuples.
 
@@ -109,6 +154,8 @@ def summarize_episodes(
     custom_metrics = collections.defaultdict(list)
     perf_stats = collections.defaultdict(list)
     hist_stats = collections.defaultdict(list)
+    episode_media = collections.defaultdict(list)
+
     for episode in episodes:
         episode_lengths.append(episode.episode_length)
         episode_rewards.append(episode.episode_reward)
@@ -121,6 +168,8 @@ def summarize_episodes(
                 policy_rewards[policy_id].append(reward)
         for k, v in episode.hist_data.items():
             hist_stats[k] += v
+        for k, v in episode.media.items():
+            episode_media[k].append(v)
     if episode_rewards:
         min_reward = min(episode_rewards)
         max_reward = max(episode_rewards)
@@ -150,15 +199,18 @@ def summarize_episodes(
         hist_stats["policy_{}_reward".format(policy_id)] = rewards
 
     for k, v_list in custom_metrics.copy().items():
-        filt = [v for v in v_list if not np.isnan(v)]
-        custom_metrics[k + "_mean"] = np.mean(filt)
-        if filt:
-            custom_metrics[k + "_min"] = np.min(filt)
-            custom_metrics[k + "_max"] = np.max(filt)
+        filt = [v for v in v_list if not np.any(np.isnan(v))]
+        if keep_custom_metrics:
+            custom_metrics[k] = filt
         else:
-            custom_metrics[k + "_min"] = float("nan")
-            custom_metrics[k + "_max"] = float("nan")
-        del custom_metrics[k]
+            custom_metrics[k + "_mean"] = np.mean(filt)
+            if filt:
+                custom_metrics[k + "_min"] = np.min(filt)
+                custom_metrics[k + "_max"] = np.max(filt)
+            else:
+                custom_metrics[k + "_min"] = float("nan")
+                custom_metrics[k + "_max"] = float("nan")
+            del custom_metrics[k]
 
     for k, v_list in perf_stats.copy().items():
         perf_stats[k] = np.mean(v_list)
@@ -178,6 +230,7 @@ def summarize_episodes(
         episode_reward_min=min_reward,
         episode_reward_mean=avg_reward,
         episode_len_mean=avg_length,
+        episode_media=dict(episode_media),
         episodes_this_iter=len(new_episodes),
         policy_reward_min=policy_reward_min,
         policy_reward_max=policy_reward_max,
@@ -185,11 +238,13 @@ def summarize_episodes(
         custom_metrics=dict(custom_metrics),
         hist_stats=dict(hist_stats),
         sampler_perf=dict(perf_stats),
-        off_policy_estimator=dict(estimators))
+        off_policy_estimator=dict(estimators),
+    )
 
 
-def _partition(episodes: List[RolloutMetrics]
-               ) -> Tuple[List[RolloutMetrics], List[OffPolicyEstimate]]:
+def _partition(
+    episodes: List[RolloutMetrics],
+) -> Tuple[List[RolloutMetrics], List[OffPolicyEstimate]]:
     """Divides metrics data into true rollouts vs off-policy estimates."""
 
     rollouts, estimates = [], []

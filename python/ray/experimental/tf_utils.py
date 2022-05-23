@@ -12,7 +12,7 @@ def unflatten(vector, shapes):
     arrays = []
     for shape in shapes:
         size = np.prod(shape, dtype=np.int)
-        array = vector[i:(i + size)].reshape(shape)
+        array = vector[i : (i + size)].reshape(shape)
         arrays.append(array)
         i += size
     assert len(vector) == i, "Passed weight does not have the correct shape."
@@ -75,13 +75,11 @@ class TensorFlowVariables:
                 if control not in explored_inputs:
                     queue.append(control)
                     explored_inputs.add(control)
-            if ("Variable" in tf_obj.node_def.op
-                    or "VarHandle" in tf_obj.node_def.op):
+            if "Variable" in tf_obj.node_def.op or "VarHandle" in tf_obj.node_def.op:
                 variable_names.append(tf_obj.node_def.name)
         self.variables = OrderedDict()
         variable_list = [
-            v for v in tf1.global_variables()
-            if v.op.node_def.name in variable_names
+            v for v in tf1.global_variables() if v.op.node_def.name in variable_names
         ]
         if input_variables is not None:
             variable_list += input_variables
@@ -98,7 +96,8 @@ class TensorFlowVariables:
                 self.placeholders[k] = tf1.placeholder(
                     var.value().dtype,
                     var.get_shape().as_list(),
-                    name="Placeholder_" + k)
+                    name="Placeholder_" + k,
+                )
                 self.assignment_nodes[k] = var.assign(self.placeholders[k])
         else:
             for v in variable_list:
@@ -110,8 +109,7 @@ class TensorFlowVariables:
         Returns:
             The length of all flattened variables concatenated.
         """
-        return sum(
-            np.prod(v.get_shape().as_list()) for v in self.variables.values())
+        return sum(np.prod(v.get_shape().as_list()) for v in self.variables.values())
 
     def get_flat(self):
         """Gets the weights and returns them as a flat array.
@@ -122,12 +120,12 @@ class TensorFlowVariables:
         # Eager mode.
         if not self.sess:
             return np.concatenate(
-                [v.numpy().flatten() for v in self.variables.values()])
+                [v.numpy().flatten() for v in self.variables.values()]
+            )
         # Graph mode.
-        return np.concatenate([
-            v.eval(session=self.sess).flatten()
-            for v in self.variables.values()
-        ])
+        return np.concatenate(
+            [v.eval(session=self.sess).flatten() for v in self.variables.values()]
+        )
 
     def set_flat(self, new_weights):
         """Sets the weights to new_weights, converting from a flat array.
@@ -145,12 +143,11 @@ class TensorFlowVariables:
             for v, a in zip(self.variables.values(), arrays):
                 v.assign(a)
         else:
-            placeholders = [
-                self.placeholders[k] for k, v in self.variables.items()
-            ]
+            placeholders = [self.placeholders[k] for k, v in self.variables.items()]
             self.sess.run(
                 list(self.assignment_nodes.values()),
-                feed_dict=dict(zip(placeholders, arrays)))
+                feed_dict=dict(zip(placeholders, arrays)),
+            )
 
     def get_weights(self):
         """Returns a dictionary containing the weights of the network.
@@ -179,19 +176,58 @@ class TensorFlowVariables:
             for name, var in self.variables.items():
                 var.assign(new_weights[name])
         else:
-            assign_list = [
-                self.assignment_nodes[name] for name in new_weights.keys()
-                if name in self.assignment_nodes
-            ]
-            assert assign_list, \
-                "No variables in the input matched those in the network. " \
-                "Possible cause: Two networks were defined in the same " \
-                "TensorFlow graph. To fix this, place each network " \
-                "definition in its own tf.Graph."
-            self.sess.run(
-                assign_list,
-                feed_dict={
-                    self.placeholders[name]: value
-                    for (name, value) in new_weights.items()
-                    if name in self.placeholders
-                })
+            assign_list, feed_dict = self._assign_weights(new_weights)
+            self.sess.run(assign_list, feed_dict=feed_dict)
+
+    def _assign_weights(self, weights):
+        """Sets weigths using exact or closest assignable variable name
+
+        Args:
+            weights (Dict): Dictionary mapping variable names to their
+                weights.
+        Returns:
+            Tuple[List, Dict]: assigned variables list, dict of
+                placeholders and weights
+        """
+
+        assigned = []
+        feed_dict = {}
+        assignable = set(self.assignment_nodes.keys())
+
+        def nb_common_elem(l1, l2):
+            return len([e for e in l1 if e in l2])
+
+        def assign(name, value):
+            feed_dict[self.placeholders[name]] = value
+            assigned.append(name)
+            assignable.remove(name)
+
+        for name, value in weights.items():
+            if name in assignable:
+                assign(name, value)
+            else:
+                common = {
+                    var: nb_common_elem(name.split("/"), var.split("/"))
+                    for var in assignable
+                }
+                select = [
+                    close_var
+                    for close_var, cn in sorted(common.items(), key=lambda i: -i[1])
+                    if cn > 0 and value.shape == self.assignment_nodes[close_var].shape
+                ]
+                if select:
+                    assign(select[0], value)
+
+        assert assigned, (
+            "No variables in the input matched those in the network. "
+            "Possible cause: Two networks were defined in the same "
+            "TensorFlow graph. To fix this, place each network "
+            "definition in its own tf.Graph."
+        )
+
+        assert len(assigned) == len(weights), (
+            "All weights couldn't be assigned because no variable "
+            "had an exact/close name or had same shape"
+        )
+
+        return [self.assignment_nodes[v] for v in assigned], feed_dict

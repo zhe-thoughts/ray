@@ -22,6 +22,7 @@
 #include "src/ray/protobuf/common.pb.h"
 
 namespace ray {
+namespace core {
 
 struct LocalityData {
   uint64_t object_size;
@@ -40,13 +41,14 @@ class LocalityDataProviderInterface {
 class LeasePolicyInterface {
  public:
   /// Get the address of the best worker node for a lease request for the provided task.
-  virtual rpc::Address GetBestNodeForTask(const TaskSpecification &spec) = 0;
+  virtual std::pair<rpc::Address, bool> GetBestNodeForTask(
+      const TaskSpecification &spec) = 0;
 
   virtual ~LeasePolicyInterface() {}
 };
 
-typedef std::function<absl::optional<rpc::Address>(const NodeID &node_id)>
-    NodeAddrFactory;
+using NodeAddrFactory =
+    std::function<absl::optional<rpc::Address>(const NodeID &node_id)>;
 
 /// Class used by the core worker to implement a locality-aware lease policy for
 /// picking a worker node for a lease request. This class is not thread-safe.
@@ -54,7 +56,8 @@ class LocalityAwareLeasePolicy : public LeasePolicyInterface {
  public:
   LocalityAwareLeasePolicy(
       std::shared_ptr<LocalityDataProviderInterface> locality_data_provider,
-      NodeAddrFactory node_addr_factory, const rpc::Address fallback_rpc_address)
+      NodeAddrFactory node_addr_factory,
+      const rpc::Address fallback_rpc_address)
       : locality_data_provider_(locality_data_provider),
         node_addr_factory_(node_addr_factory),
         fallback_rpc_address_(fallback_rpc_address) {}
@@ -62,7 +65,8 @@ class LocalityAwareLeasePolicy : public LeasePolicyInterface {
   ~LocalityAwareLeasePolicy() {}
 
   /// Get the address of the best worker node for a lease request for the provided task.
-  rpc::Address GetBestNodeForTask(const TaskSpecification &spec);
+  std::pair<rpc::Address, bool> GetBestNodeForTask(
+      const TaskSpecification &spec) override;
 
  private:
   /// Get the best worker node for a lease request for the provided task.
@@ -88,11 +92,13 @@ class LocalLeasePolicy : public LeasePolicyInterface {
   ~LocalLeasePolicy() {}
 
   /// Get the address of the local node for a lease request for the provided task.
-  rpc::Address GetBestNodeForTask(const TaskSpecification &spec);
+  std::pair<rpc::Address, bool> GetBestNodeForTask(
+      const TaskSpecification &spec) override;
 
  private:
   /// RPC address of the local node.
   const rpc::Address local_node_rpc_address_;
 };
 
+}  // namespace core
 }  // namespace ray

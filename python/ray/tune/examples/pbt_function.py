@@ -75,20 +75,11 @@ def pbt_function(config, checkpoint_dir=None):
             cur_lr=lr,
             optimal_lr=optimal_lr,  # for debugging
             q_err=q_err,  # for debugging
-            done=accuracy > midpoint * 2  # this stops the training process
+            done=accuracy > midpoint * 2,  # this stops the training process
         )
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--smoke-test", action="store_true", help="Finish quickly for testing")
-    args, _ = parser.parse_known_args()
-    if args.smoke_test:
-        ray.init(num_cpus=2)  # force pausing to happen for test
-    else:
-        ray.init()
-
+def run_tune_pbt():
     pbt = PopulationBasedTraining(
         time_attr="training_iteration",
         perturbation_interval=4,
@@ -97,7 +88,8 @@ if __name__ == "__main__":
             "lr": lambda: random.uniform(0.0001, 0.02),
             # allow perturbations within this set of categorical values
             "some_other_factor": [1, 2],
-        })
+        },
+    )
 
     analysis = tune.run(
         pbt_function,
@@ -116,6 +108,31 @@ if __name__ == "__main__":
             # note: this parameter is perturbed but has no effect on
             # the model training in this example
             "some_other_factor": 1,
-        })
+        },
+    )
 
     print("Best hyperparameters found were: ", analysis.best_config)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--smoke-test", action="store_true", help="Finish quickly for testing"
+    )
+    parser.add_argument(
+        "--server-address",
+        type=str,
+        default=None,
+        required=False,
+        help="The address of server to connect to if using Ray Client.",
+    )
+    args, _ = parser.parse_known_args()
+    if args.smoke_test:
+        ray.init(num_cpus=2)  # force pausing to happen for test
+    else:
+        if args.server_address is not None:
+            ray.init(f"ray://{args.server_address}")
+        else:
+            ray.init()
+
+    run_tune_pbt()

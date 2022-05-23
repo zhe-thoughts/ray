@@ -3,18 +3,16 @@ package io.ray.test;
 import io.ray.api.ActorHandle;
 import io.ray.api.ObjectRef;
 import io.ray.api.Ray;
+import io.ray.api.exception.RayActorException;
+import io.ray.api.exception.RayTaskException;
+import io.ray.api.exception.RayWorkerException;
+import io.ray.api.exception.UnreconstructableException;
 import io.ray.api.function.RayFunc0;
 import io.ray.api.id.ObjectId;
-import io.ray.runtime.exception.RayActorException;
-import io.ray.runtime.exception.RayTaskException;
-import io.ray.runtime.exception.RayWorkerException;
-import io.ray.runtime.exception.UnreconstructableException;
-import java.time.Duration;
-import java.time.Instant;
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import org.testng.Assert;
-import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
@@ -25,15 +23,7 @@ public class FailureTest extends BaseTest {
 
   @BeforeClass
   public void setUp() {
-    // This is needed by `testGetThrowsQuicklyWhenFoundException`.
-    // Set one worker per process. Otherwise, if `badFunc2` and `slowFunc` run in the same
-    // process, `sleep` will delay `System.exit`.
-    System.setProperty("ray.job.num-java-workers-per-process", "1");
-  }
-
-  @AfterClass
-  public void tearDown() {
-    System.clearProperty("ray.job.num-java-workers-per-process");
+    System.setProperty("ray.raylet.startup-token", "0");
   }
 
   public static int badFunc() {
@@ -54,6 +44,10 @@ public class FailureTest extends BaseTest {
     return 0;
   }
 
+  public static int echo(int obj) {
+    return obj;
+  }
+
   public static class BadActor {
 
     public BadActor(boolean failOnCreation) {
@@ -72,6 +66,18 @@ public class FailureTest extends BaseTest {
     }
   }
 
+  public static class SlowActor {
+    public SlowActor(ActorHandle<SignalActor> signalActor) {
+      if (Ray.getRuntimeContext().wasCurrentActorRestarted()) {
+        signalActor.task(SignalActor::waitSignal).remote().get();
+      }
+    }
+
+    public String ping() {
+      return "pong";
+    }
+  }
+
   private static void assertTaskFailedWithRayTaskException(ObjectRef<?> objectRef) {
     try {
       objectRef.get();
@@ -86,13 +92,27 @@ public class FailureTest extends BaseTest {
     }
   }
 
+  private static void assertTaskFailedWithRayActorException(ObjectRef<?> objectRef) {
+    try {
+      objectRef.get();
+      Assert.fail("Task didn't fail.");
+    } catch (RayActorException e) {
+      Throwable rootCause = e;
+      while (rootCause.getCause() != null) {
+        rootCause = rootCause.getCause();
+      }
+      Assert.assertTrue(rootCause instanceof RuntimeException);
+      Assert.assertTrue(rootCause.getMessage().contains(EXCEPTION_MESSAGE));
+    }
+  }
+
   public void testNormalTaskFailure() {
     assertTaskFailedWithRayTaskException(Ray.task(FailureTest::badFunc).remote());
   }
 
   public void testActorCreationFailure() {
     ActorHandle<BadActor> actor = Ray.actor(BadActor::new, true).remote();
-    assertTaskFailedWithRayTaskException(actor.task(BadActor::badMethod).remote());
+    assertTaskFailedWithRayActorException(actor.task(BadActor::badMethod).remote());
   }
 
   public void testActorTaskFailure() {
@@ -129,6 +149,28 @@ public class FailureTest extends BaseTest {
     }
   }
 
+  public void testActorTaskFastFail() throws IOException, InterruptedException {
+    ActorHandle<SignalActor> signalActor = SignalActor.create();
+    // NOTE(kfstorm): Currently, `max_task_retries` is always 0 for actors created in Java.
+    // Once `max_task_retries` is configurable in Java, we'd better set it to 0 explicitly to show
+    // the test scenario.
+    ActorHandle<SlowActor> actor =
+        Ray.actor(SlowActor::new, signalActor).setMaxRestarts(1).remote();
+    actor.task(SlowActor::ping).remote().get();
+    actor.kill(/*noRestart=*/ false);
+
+    // Wait for a while so that now the driver knows the actor is in RESTARTING state.
+    Thread.sleep(1000);
+    // An actor task should fail quickly until the actor is restarted.
+    Assert.expectThrows(RayActorException.class, () -> actor.task(SlowActor::ping).remote().get());
+
+    signalActor.task(SignalActor::sendSignal).remote().get();
+    // Wait for a while so that now the driver knows the actor is in ALIVE state.
+    Thread.sleep(1000);
+    // An actor task should succeed.
+    actor.task(SlowActor::ping).remote().get();
+  }
+
   public void testGetThrowsQuicklyWhenFoundException() {
     List<RayFunc0<Integer>> badFunctions =
         Arrays.asList(FailureTest::badFunc, FailureTest::badFunc2);
@@ -136,17 +178,10 @@ public class FailureTest extends BaseTest {
     for (RayFunc0<Integer> badFunc : badFunctions) {
       ObjectRef<Integer> obj1 = Ray.task(badFunc).remote();
       ObjectRef<Integer> obj2 = Ray.task(FailureTest::slowFunc).remote();
-      Instant start = Instant.now();
-      try {
-        Ray.get(Arrays.asList(obj1, obj2));
-        Assert.fail("Should throw RayException.");
-      } catch (RuntimeException e) {
-        Instant end = Instant.now();
-        long duration = Duration.between(start, end).toMillis();
-        Assert.assertTrue(
-            duration < 5000,
-            "Should fail quickly. " + "Actual execution time: " + duration + " ms.");
-      }
+      TestUtils.executeWithinTime(
+          () ->
+              Assert.expectThrows(RuntimeException.class, () -> Ray.get(Arrays.asList(obj1, obj2))),
+          5000);
     }
   }
 
@@ -155,14 +190,16 @@ public class FailureTest extends BaseTest {
         Assert.expectThrows(
             RayTaskException.class,
             () -> {
-              Ray.put(new RayTaskException("xxx", new RayActorException())).get();
+              Ray.put(new RayTaskException(10008, "localhost", "xxx", new RayActorException()))
+                  .get();
             });
     Assert.assertEquals(ex1.getCause().getClass(), RayActorException.class);
     RayTaskException ex2 =
         Assert.expectThrows(
             RayTaskException.class,
             () -> {
-              Ray.put(new RayTaskException("xxx", new RayWorkerException())).get();
+              Ray.put(new RayTaskException(10008, "localhost", "xxx", new RayWorkerException()))
+                  .get();
             });
     Assert.assertEquals(ex2.getCause().getClass(), RayWorkerException.class);
 
@@ -171,9 +208,23 @@ public class FailureTest extends BaseTest {
         Assert.expectThrows(
             RayTaskException.class,
             () -> {
-              Ray.put(new RayTaskException("xxx", new UnreconstructableException(objectId))).get();
+              Ray.put(
+                      new RayTaskException(
+                          10008, "localhost", "xxx", new UnreconstructableException(objectId)))
+                  .get();
             });
     Assert.assertEquals(ex3.getCause().getClass(), UnreconstructableException.class);
     Assert.assertEquals(((UnreconstructableException) ex3.getCause()).objectId, objectId);
+  }
+
+  public void testTaskChainWithException() {
+    ObjectRef<Integer> obj1 = Ray.task(FailureTest::badFunc).remote();
+    ObjectRef<Integer> obj2 = Ray.task(FailureTest::echo, obj1).remote();
+    RayTaskException ex = Assert.expectThrows(RayTaskException.class, () -> Ray.get(obj2));
+    Assert.assertTrue(ex.getCause() instanceof RayTaskException);
+    RayTaskException ex2 = (RayTaskException) ex.getCause();
+    Assert.assertTrue(ex2.getCause() instanceof RuntimeException);
+    RuntimeException ex3 = (RuntimeException) ex2.getCause();
+    Assert.assertEquals(EXCEPTION_MESSAGE, ex3.getMessage());
   }
 }

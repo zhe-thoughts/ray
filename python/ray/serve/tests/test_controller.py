@@ -1,23 +1,45 @@
 import pytest
+import time
 
 import ray
+from ray import serve
+from ray.serve.common import DeploymentInfo
+from ray.serve.generated.serve_pb2 import DeploymentRoute
 
 
-def test_controller_inflight_requests_clear(serve_instance):
-    client = serve_instance
-    initial_number_reqs = ray.get(
-        client._controller._num_pending_goals.remote())
+def test_redeploy_start_time(serve_instance):
+    """Check that redeploying a deployment doesn't reset its start time."""
 
-    def function(_):
-        return "hello"
+    controller = serve.context._global_client._controller
 
-    client.create_backend("tst", function)
-    client.create_endpoint("end_pt", backend="tst")
+    @serve.deployment
+    def test(_):
+        return "1"
 
-    assert ray.get(client._controller._num_pending_goals.remote()
-                   ) - initial_number_reqs == 0
+    test.deploy()
+    deployment_route = DeploymentRoute.FromString(
+        ray.get(controller.get_deployment_info.remote("test"))
+    )
+    deployment_info_1 = DeploymentInfo.from_proto(deployment_route.deployment_info)
+    start_time_ms_1 = deployment_info_1.start_time_ms
+
+    time.sleep(0.1)
+
+    @serve.deployment
+    def test(_):
+        return "2"
+
+    test.deploy()
+    deployment_route = DeploymentRoute.FromString(
+        ray.get(controller.get_deployment_info.remote("test"))
+    )
+    deployment_info_2 = DeploymentInfo.from_proto(deployment_route.deployment_info)
+    start_time_ms_2 = deployment_info_2.start_time_ms
+
+    assert start_time_ms_1 == start_time_ms_2
 
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(pytest.main(["-v", "-s", __file__]))

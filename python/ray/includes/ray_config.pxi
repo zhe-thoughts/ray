@@ -10,8 +10,8 @@ cdef class Config:
         return RayConfig.instance().handler_warning_timeout_ms()
 
     @staticmethod
-    def raylet_heartbeat_timeout_milliseconds():
-        return RayConfig.instance().raylet_heartbeat_timeout_milliseconds()
+    def raylet_heartbeat_period_milliseconds():
+        return RayConfig.instance().raylet_heartbeat_period_milliseconds()
 
     @staticmethod
     def debug_dump_period_milliseconds():
@@ -89,14 +89,6 @@ cdef class Config:
         return RayConfig.instance().maximum_gcs_deletion_batch_size()
 
     @staticmethod
-    def put_small_object_in_memory_store():
-        return RayConfig.instance().put_small_object_in_memory_store()
-
-    @staticmethod
-    def max_tasks_in_flight_per_worker():
-        return RayConfig.instance().max_tasks_in_flight_per_worker()
-
-    @staticmethod
     def metrics_report_interval_ms():
         return RayConfig.instance().metrics_report_interval_ms()
 
@@ -105,9 +97,17 @@ cdef class Config:
         return RayConfig.instance().enable_timeline()
 
     @staticmethod
-    def automatic_object_deletion_enabled():
-        return RayConfig.instance().automatic_object_deletion_enabled()
-
-    @staticmethod
     def max_grpc_message_size():
         return RayConfig.instance().max_grpc_message_size()
+
+    @staticmethod
+    def record_ref_creation_sites():
+        return RayConfig.instance().record_ref_creation_sites()
+
+    @staticmethod
+    def start_python_importer_thread():
+        return RayConfig.instance().start_python_importer_thread()
+
+    @staticmethod
+    def use_ray_syncer():
+        return RayConfig.instance().use_ray_syncer()

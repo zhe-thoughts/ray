@@ -6,7 +6,8 @@ from typing import List
 
 import ray
 
-from ray._raylet import (TaskID, ActorID, JobID)
+from ray._raylet import TaskID, ActorID, JobID
+from ray.internal.internal_api import node_stats
 import logging
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ def decode_object_ref_if_needed(object_ref: str) -> bytes:
         # when it is base64 encoded because objectRef is always 20B.
         return base64.standard_b64decode(object_ref)
     else:
-        return ray.utils.hex_to_binary(object_ref)
+        return ray._private.utils.hex_to_binary(object_ref)
 
 
 class SortingType(Enum):
@@ -58,25 +59,62 @@ class ReferenceType:
     UNKNOWN_STATUS = "UNKNOWN_STATUS"
 
 
+def get_sorting_type(sort_by: str):
+    """Translate string input into SortingType instance"""
+    sort_by = sort_by.upper()
+    if sort_by == "PID":
+        return SortingType.PID
+    elif sort_by == "OBJECT_SIZE":
+        return SortingType.OBJECT_SIZE
+    elif sort_by == "REFERENCE_TYPE":
+        return SortingType.REFERENCE_TYPE
+    else:
+        raise Exception(
+            "The sort-by input provided is not one of\
+                PID, OBJECT_SIZE, or REFERENCE_TYPE."
+        )
+
+
+def get_group_by_type(group_by: str):
+    """Translate string input into GroupByType instance"""
+    group_by = group_by.upper()
+    if group_by == "NODE_ADDRESS":
+        return GroupByType.NODE_ADDRESS
+    elif group_by == "STACK_TRACE":
+        return GroupByType.STACK_TRACE
+    else:
+        raise Exception(
+            "The group-by input provided is not one of\
+                NODE_ADDRESS or STACK_TRACE."
+        )
+
+
 class MemoryTableEntry:
-    def __init__(self, *, object_ref: dict, node_address: str, is_driver: bool,
-                 pid: int):
+    def __init__(
+        self, *, object_ref: dict, node_address: str, is_driver: bool, pid: int
+    ):
         # worker info
         self.is_driver = is_driver
         self.pid = pid
         self.node_address = node_address
 
         # object info
+        self.task_status = object_ref.get("taskStatus", "?")
+        if self.task_status == "NIL":
+            self.task_status = "-"
+        self.attempt_number = int(object_ref.get("attemptNumber", 0))
+        if self.attempt_number > 0:
+            self.task_status = f"Attempt #{self.attempt_number + 1}: {self.task_status}"
         self.object_size = int(object_ref.get("objectSize", -1))
         self.call_site = object_ref.get("callSite", "<Unknown>")
         self.object_ref = ray.ObjectRef(
-            decode_object_ref_if_needed(object_ref["objectId"]))
+            decode_object_ref_if_needed(object_ref["objectId"])
+        )
 
         # reference info
         self.local_ref_count = int(object_ref.get("localRefCount", 0))
         self.pinned_in_memory = bool(object_ref.get("pinnedInMemory", False))
-        self.submitted_task_ref_count = int(
-            object_ref.get("submittedTaskRefCount", 0))
+        self.submitted_task_ref_count = int(object_ref.get("submittedTaskRefCount", 0))
         self.contained_in_owned = [
             ray.ObjectRef(decode_object_ref_if_needed(object_ref))
             for object_ref in object_ref.get("containedInOwned", [])
@@ -86,9 +124,12 @@ class MemoryTableEntry:
     def is_valid(self) -> bool:
         # If the entry doesn't have a reference type or some invalid state,
         # (e.g., no object ref presented), it is considered invalid.
-        if (not self.pinned_in_memory and self.local_ref_count == 0
-                and self.submitted_task_ref_count == 0
-                and len(self.contained_in_owned) == 0):
+        if (
+            not self.pinned_in_memory
+            and self.local_ref_count == 0
+            and self.submitted_task_ref_count == 0
+            and len(self.contained_in_owned) == 0
+        ):
             return False
         elif self.object_ref.is_nil():
             return False
@@ -126,10 +167,10 @@ class MemoryTableEntry:
         # are not all 'f', that means it is an actor creation
         # task, which is an actor handle.
         random_bits = object_ref_hex[:TASKID_RANDOM_BITS_SIZE]
-        actor_random_bits = object_ref_hex[TASKID_RANDOM_BITS_SIZE:
-                                           TASKID_RANDOM_BITS_SIZE +
-                                           ACTORID_RANDOM_BITS_SIZE]
-        if (random_bits == "f" * 16 and not actor_random_bits == "f" * 8):
+        actor_random_bits = object_ref_hex[
+            TASKID_RANDOM_BITS_SIZE : TASKID_RANDOM_BITS_SIZE + ACTORID_RANDOM_BITS_SIZE
+        ]
+        if random_bits == "f" * 16 and not actor_random_bits == "f" * 24:
             return True
         else:
             return False
@@ -142,13 +183,14 @@ class MemoryTableEntry:
             "object_size": self.object_size,
             "reference_type": self.reference_type,
             "call_site": self.call_site,
+            "task_status": self.task_status,
             "local_ref_count": self.local_ref_count,
             "pinned_in_memory": self.pinned_in_memory,
             "submitted_task_ref_count": self.submitted_task_ref_count,
             "contained_in_owned": [
                 object_ref.hex() for object_ref in self.contained_in_owned
             ],
-            "type": "Driver" if self.is_driver else "Worker"
+            "type": "Driver" if self.is_driver else "Worker",
         }
 
     def __str__(self):
@@ -159,10 +201,12 @@ class MemoryTableEntry:
 
 
 class MemoryTable:
-    def __init__(self,
-                 entries: List[MemoryTableEntry],
-                 group_by_type: GroupByType = GroupByType.NODE_ADDRESS,
-                 sort_by_type: SortingType = SortingType.PID):
+    def __init__(
+        self,
+        entries: List[MemoryTableEntry],
+        group_by_type: GroupByType = GroupByType.NODE_ADDRESS,
+        sort_by_type: SortingType = SortingType.PID,
+    ):
         self.table = entries
         # Group is a list of memory tables grouped by a group key.
         self.group = {}
@@ -220,7 +264,7 @@ class MemoryTable:
             "total_pinned_in_memory": total_pinned_in_memory,
             "total_used_by_pending_task": total_used_by_pending_task,
             "total_captured_in_objects": total_captured_in_objects,
-            "total_actor_handles": total_actor_handles
+            "total_actor_handles": total_actor_handles,
         }
         return self
 
@@ -251,7 +295,8 @@ class MemoryTable:
         # Build a group table.
         for group_key, entries in group.items():
             self.group[group_key] = MemoryTable(
-                entries, group_by_type=None, sort_by_type=None)
+                entries, group_by_type=None, sort_by_type=None
+            )
         for group_key, group_memory_table in self.group.items():
             group_memory_table.summarize()
         return self
@@ -262,10 +307,10 @@ class MemoryTable:
             "group": {
                 group_key: {
                     "entries": group_memory_table.get_entries(),
-                    "summary": group_memory_table.summary
+                    "summary": group_memory_table.summary,
                 }
                 for group_key, group_memory_table in self.group.items()
-            }
+            },
         }
 
     def get_entries(self) -> List[dict]:
@@ -278,9 +323,11 @@ class MemoryTable:
         return self.__repr__()
 
 
-def construct_memory_table(workers_stats: List,
-                           group_by: GroupByType = GroupByType.NODE_ADDRESS,
-                           sort_by=SortingType.OBJECT_SIZE) -> MemoryTable:
+def construct_memory_table(
+    workers_stats: List,
+    group_by: GroupByType = GroupByType.NODE_ADDRESS,
+    sort_by=SortingType.OBJECT_SIZE,
+) -> MemoryTable:
     memory_table_entries = []
     for core_worker_stats in workers_stats:
         pid = core_worker_stats["pid"]
@@ -293,9 +340,183 @@ def construct_memory_table(workers_stats: List,
                 object_ref=object_ref,
                 node_address=node_address,
                 is_driver=is_driver,
-                pid=pid)
+                pid=pid,
+            )
             if memory_table_entry.is_valid():
                 memory_table_entries.append(memory_table_entry)
     memory_table = MemoryTable(
-        memory_table_entries, group_by_type=group_by, sort_by_type=sort_by)
+        memory_table_entries, group_by_type=group_by, sort_by_type=sort_by
+    )
     return memory_table
+
+
+def track_reference_size(group):
+    """Returns dictionary mapping reference type
+    to memory usage for a given memory table group."""
+    d = defaultdict(int)
+    table_name = {
+        "LOCAL_REFERENCE": "total_local_ref_count",
+        "PINNED_IN_MEMORY": "total_pinned_in_memory",
+        "USED_BY_PENDING_TASK": "total_used_by_pending_task",
+        "CAPTURED_IN_OBJECT": "total_captured_in_objects",
+        "ACTOR_HANDLE": "total_actor_handles",
+    }
+    for entry in group["entries"]:
+        size = entry["object_size"]
+        if size == -1:
+            # size not recorded
+            size = 0
+        d[table_name[entry["reference_type"]]] += size
+    return d
+
+
+def memory_summary(
+    state,
+    group_by="NODE_ADDRESS",
+    sort_by="OBJECT_SIZE",
+    line_wrap=True,
+    unit="B",
+    num_entries=None,
+) -> str:
+    from ray.dashboard.modules.node.node_head import node_stats_to_dict
+
+    # Get terminal size
+    import shutil
+
+    size = shutil.get_terminal_size((80, 20)).columns
+    line_wrap_threshold = 137
+
+    # Unit conversions
+    units = {"B": 10 ** 0, "KB": 10 ** 3, "MB": 10 ** 6, "GB": 10 ** 9}
+
+    # Fetch core memory worker stats, store as a dictionary
+    core_worker_stats = []
+    for raylet in state.node_table():
+        if not raylet["Alive"]:
+            continue
+        try:
+            stats = node_stats_to_dict(
+                node_stats(raylet["NodeManagerAddress"], raylet["NodeManagerPort"])
+            )
+        except RuntimeError:
+            continue
+        core_worker_stats.extend(stats["coreWorkersStats"])
+        assert type(stats) is dict and "coreWorkersStats" in stats
+
+    # Build memory table with "group_by" and "sort_by" parameters
+    group_by, sort_by = get_group_by_type(group_by), get_sorting_type(sort_by)
+    memory_table = construct_memory_table(
+        core_worker_stats, group_by, sort_by
+    ).as_dict()
+    assert "summary" in memory_table and "group" in memory_table
+
+    # Build memory summary
+    mem = ""
+    group_by, sort_by = group_by.name.lower().replace(
+        "_", " "
+    ), sort_by.name.lower().replace("_", " ")
+    summary_labels = [
+        "Mem Used by Objects",
+        "Local References",
+        "Pinned",
+        "Used by task",
+        "Captured in Objects",
+        "Actor Handles",
+    ]
+    summary_string = "{:<19}  {:<16}  {:<12}  {:<13}  {:<19}  {:<13}\n"
+
+    object_ref_labels = [
+        "IP Address",
+        "PID",
+        "Type",
+        "Call Site",
+        "Status",
+        "Size",
+        "Reference Type",
+        "Object Ref",
+    ]
+    object_ref_string = "{:<13} | {:<8} | {:<7} | {:<9} \
+| {:<9} | {:<8} | {:<14} | {:<10}\n"
+
+    if size > line_wrap_threshold and line_wrap:
+        object_ref_string = "{:<15}  {:<5}  {:<6}  {:<22}  {:<14}  {:<6}  {:<18}  \
+{:<56}\n"
+
+    mem += f"Grouping by {group_by}...\
+        Sorting by {sort_by}...\
+        Display {num_entries if num_entries is not None else 'all'}\
+entries per group...\n\n\n"
+
+    for key, group in memory_table["group"].items():
+        # Group summary
+        summary = group["summary"]
+        ref_size = track_reference_size(group)
+        for k, v in summary.items():
+            if k == "total_object_size":
+                summary[k] = str(v / units[unit]) + f" {unit}"
+            else:
+                summary[k] = str(v) + f", ({ref_size[k] / units[unit]} {unit})"
+        mem += f"--- Summary for {group_by}: {key} ---\n"
+        mem += summary_string.format(*summary_labels)
+        mem += summary_string.format(*summary.values()) + "\n"
+
+        # Memory table per group
+        mem += f"--- Object references for {group_by}: {key} ---\n"
+        mem += object_ref_string.format(*object_ref_labels)
+        n = 1  # Counter for num entries per group
+        for entry in group["entries"]:
+            if num_entries is not None and n > num_entries:
+                break
+            entry["object_size"] = (
+                str(entry["object_size"] / units[unit]) + f" {unit}"
+                if entry["object_size"] > -1
+                else "?"
+            )
+            num_lines = 1
+            if size > line_wrap_threshold and line_wrap:
+                call_site_length = 22
+                if len(entry["call_site"]) == 0:
+                    entry["call_site"] = ["disabled"]
+                else:
+                    entry["call_site"] = [
+                        entry["call_site"][i : i + call_site_length]
+                        for i in range(0, len(entry["call_site"]), call_site_length)
+                    ]
+
+                task_status_length = 12
+                entry["task_status"] = [
+                    entry["task_status"][i : i + task_status_length]
+                    for i in range(0, len(entry["task_status"]), task_status_length)
+                ]
+                num_lines = max(len(entry["call_site"]), len(entry["task_status"]))
+
+            else:
+                mem += "\n"
+            object_ref_values = [
+                entry["node_ip_address"],
+                entry["pid"],
+                entry["type"],
+                entry["call_site"],
+                entry["task_status"],
+                entry["object_size"],
+                entry["reference_type"],
+                entry["object_ref"],
+            ]
+            for i in range(len(object_ref_values)):
+                if not isinstance(object_ref_values[i], list):
+                    object_ref_values[i] = [object_ref_values[i]]
+                object_ref_values[i].extend(
+                    ["" for x in range(num_lines - len(object_ref_values[i]))]
+                )
+            for i in range(num_lines):
+                row = [elem[i] for elem in object_ref_values]
+                mem += object_ref_string.format(*row)
+            mem += "\n"
+            n += 1
+
+    mem += (
+        "To record callsite information for each ObjectRef created, set "
+        "env variable RAY_record_ref_creation_sites=1\n\n"
+    )
+
+    return mem

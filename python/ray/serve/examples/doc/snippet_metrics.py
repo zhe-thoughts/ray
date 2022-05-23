@@ -4,16 +4,16 @@ from ray import serve
 import time
 
 ray.init(address="auto")
-client = serve.start()
+serve.start()
 
 
-def f(request):
+@serve.deployment
+def f():
     time.sleep(1)
 
 
-client.create_backend("f", f)
-client.create_endpoint("f", backend="f")
+f.deploy()
 
-handle = client.get_handle("f")
-while (True):
+handle = f.get_handle()
+while True:
     ray.get(handle.remote())

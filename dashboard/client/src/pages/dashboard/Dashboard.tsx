@@ -1,4 +1,5 @@
 import {
+  Button,
   createStyles,
   makeStyles,
   Tab,
@@ -6,9 +7,16 @@ import {
   Theme,
   Typography,
 } from "@material-ui/core";
-import React, { useCallback, useEffect, useRef } from "react";
+import { Alert } from "@material-ui/lab";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
-import { getActorGroups, getNodeInfo, getTuneAvailability } from "../../api";
+import { useHistory } from "react-router-dom";
+import {
+  getActorGroups,
+  getNodeInfo,
+  getTuneAvailability,
+  getUsageStatsEnabled,
+} from "../../api";
 import { StoreState } from "../../store";
 import LastUpdated from "./LastUpdated";
 import LogicalView from "./logical-view/LogicalView";
@@ -18,13 +26,8 @@ import RayConfig from "./ray-config/RayConfig";
 import { dashboardActions } from "./state";
 import Tune from "./tune/Tune";
 
-const {
-  setNodeInfo,
-  setTuneAvailability,
-  setActorGroups,
-  setError,
-  setTab,
-} = dashboardActions;
+const { setNodeInfo, setTuneAvailability, setActorGroups, setError, setTab } =
+  dashboardActions;
 const useDashboardStyles = makeStyles((theme: Theme) =>
   createStyles({
     root: {
@@ -33,6 +36,7 @@ const useDashboardStyles = makeStyles((theme: Theme) =>
       "& > :not(:first-child)": {
         marginTop: theme.spacing(4),
       },
+      position: "relative",
     },
     tabs: {
       borderBottomColor: theme.palette.divider,
@@ -59,6 +63,7 @@ const Dashboard: React.FC = () => {
   const tuneAvailability = useSelector(tuneAvailabilitySelector);
   const tab = useSelector(tabSelector);
   const classes = useDashboardStyles();
+  const history = useHistory();
 
   // Polling Function
   const refreshInfo = useCallback(async () => {
@@ -100,9 +105,26 @@ const Dashboard: React.FC = () => {
   }
 
   const SelectedComponent = tabs[tab].component;
+  const [usageStatsPromptEnabled, setUsageStatsPromptEnabled] = useState(false);
+  const [usageStatsEnabled, setUsageStatsEnabled] = useState(false);
+  useEffect(() => {
+    getUsageStatsEnabled().then((res) => {
+      setUsageStatsPromptEnabled(res.usageStatsPromptEnabled);
+      setUsageStatsEnabled(res.usageStatsEnabled);
+    });
+  }, []);
   return (
     <div className={classes.root}>
       <Typography variant="h5">Ray Dashboard</Typography>
+      <Button
+        style={{ position: "absolute", right: 16, top: 16 }}
+        variant="contained"
+        size="small"
+        color="primary"
+        onClick={() => history.push("/node")}
+      >
+        Try Experimental Dashboard
+      </Button>
       <Tabs
         className={classes.tabs}
         indicatorColor="primary"
@@ -115,6 +137,28 @@ const Dashboard: React.FC = () => {
         ))}
       </Tabs>
       <SelectedComponent />
+      {usageStatsPromptEnabled ? (
+        <Alert style={{ marginTop: 30 }} severity="info">
+          {usageStatsEnabled ? (
+            <span>
+              Usage stats collection is enabled. To disable this, add
+              `--disable-usage-stats` to the command that starts the cluster, or
+              run the following command: `ray disable-usage-stats` before
+              starting the cluster. See{" "}
+              <a
+                href="https://docs.ray.io/en/master/cluster/usage-stats.html"
+                target="_blank"
+                rel="noreferrer"
+              >
+                https://docs.ray.io/en/master/cluster/usage-stats.html
+              </a>{" "}
+              for more details.
+            </span>
+          ) : (
+            <span>Usage stats collection is disabled.</span>
+          )}
+        </Alert>
+      ) : null}
       <LastUpdated />
     </div>
   );

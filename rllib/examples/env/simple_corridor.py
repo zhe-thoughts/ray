@@ -8,11 +8,12 @@ class SimpleCorridor(gym.Env):
 
     You can configure the length of the corridor via the env config."""
 
-    def __init__(self, config):
-        self.end_pos = config["corridor_length"]
+    def __init__(self, config=None):
+        config = config or {}
+        self.end_pos = config.get("corridor_length", 10)
         self.cur_pos = 0
         self.action_space = Discrete(2)
-        self.observation_space = Box(0.0, 999.0, shape=(1, ), dtype=np.float32)
+        self.observation_space = Box(0.0, 999.0, shape=(1,), dtype=np.float32)
 
     def set_corridor_length(self, length):
         self.end_pos = length

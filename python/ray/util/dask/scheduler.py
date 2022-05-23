@@ -1,22 +1,82 @@
 import atexit
-from collections import defaultdict
-from multiprocessing.pool import ThreadPool
 import threading
+from collections import defaultdict
+from dataclasses import dataclass
+from multiprocessing.pool import ThreadPool
+from typing import Optional
 
 import ray
 
+import dask
 from dask.core import istask, ishashable, _execute_task
-from dask.local import get_async, apply_sync
 from dask.system import CPU_COUNT
 from dask.threaded import pack_exception, _thread_get_id
 
-from .callbacks import local_ray_callbacks, unpack_ray_callbacks
-from .common import unpack_object_refs
+from ray.util.dask.callbacks import local_ray_callbacks, unpack_ray_callbacks
+from ray.util.dask.common import unpack_object_refs
+from ray.util.dask.scheduler_utils import get_async, apply_sync
 
 main_thread = threading.current_thread()
 default_pool = None
 pools = defaultdict(dict)
 pools_lock = threading.Lock()
+
+TOP_LEVEL_RESOURCES_ERR_MSG = (
+    'Use ray_remote_args={"resources": {...}} instead of resources={...} to specify '
+    "required Ray task resources; see "
+    "https://docs.ray.io/en/master/ray-core/package-ref.html#ray-remote."
+)
+
+
+def enable_dask_on_ray(
+    shuffle: Optional[str] = "tasks",
+    use_shuffle_optimization: Optional[bool] = True,
+) -> dask.config.set:
+    """
+    Enable Dask-on-Ray scheduler. This helper sets the Dask-on-Ray scheduler
+    as the default Dask scheduler in the Dask config. By default, it will also
+    cause the task-based shuffle to be used for any Dask shuffle operations
+    (required for multi-node Ray clusters, not sharing a filesystem), and will
+    enable a Ray-specific shuffle optimization.
+
+    >>> enable_dask_on_ray()
+    >>> ddf.compute()  # <-- will use the Dask-on-Ray scheduler.
+
+    If used as a context manager, the Dask-on-Ray scheduler will only be used
+    within the context's scope.
+
+    >>> with enable_dask_on_ray():
+    ...     ddf.compute()  # <-- will use the Dask-on-Ray scheduler.
+    >>> ddf.compute()  # <-- won't use the Dask-on-Ray scheduler.
+
+    Args:
+        shuffle: The shuffle method used by Dask, either "tasks" or
+            "disk". This should be "tasks" if using a multi-node Ray cluster.
+            Defaults to "tasks".
+        use_shuffle_optimization: Enable our custom Ray-specific shuffle
+            optimization. Defaults to True.
+    Returns:
+        The Dask config object, which can be used as a context manager to limit
+        the scope of the Dask-on-Ray scheduler to the corresponding context.
+    """
+    if use_shuffle_optimization:
+        from ray.util.dask.optimizations import dataframe_optimize
+    else:
+        dataframe_optimize = None
+    # Manually set the global Dask scheduler config.
+    # We also force the task-based shuffle to be used since the disk-based
+    # shuffle doesn't work for a multi-node Ray cluster that doesn't share
+    # the filesystem.
+    return dask.config.set(
+        scheduler=ray_dask_get, shuffle=shuffle, dataframe_optimize=dataframe_optimize
+    )
+
+
+def disable_dask_on_ray():
+    """
+    Unsets the scheduler, shuffle method, and DataFrame optimizer.
+    """
+    return dask.config.set(scheduler=None, shuffle=None, dataframe_optimize=None)
 
 
 def ray_dask_get(dsk, keys, **kwargs):
@@ -78,6 +138,23 @@ def ray_dask_get(dsk, keys, **kwargs):
                 pools[thread][num_workers] = pool
 
     ray_callbacks = kwargs.pop("ray_callbacks", None)
+    persist = kwargs.pop("ray_persist", False)
+    enable_progress_bar = kwargs.pop("_ray_enable_progress_bar", None)
+
+    # Handle Ray remote args and resource annotations.
+    if "resources" in kwargs:
+        raise ValueError(TOP_LEVEL_RESOURCES_ERR_MSG)
+    ray_remote_args = kwargs.pop("ray_remote_args", {})
+    try:
+        annotations = dask.config.get("annotations")
+    except KeyError:
+        annotations = {}
+    if "resources" in annotations:
+        raise ValueError(TOP_LEVEL_RESOURCES_ERR_MSG)
+
+    scoped_ray_remote_args = _build_key_scoped_ray_remote_args(
+        dsk, annotations, ray_remote_args
+    )
 
     with local_ray_callbacks(ray_callbacks) as ray_callbacks:
         # Unpack the Ray-specific callbacks.
@@ -99,6 +176,7 @@ def ray_dask_get(dsk, keys, **kwargs):
                 ray_postsubmit_cbs,
                 ray_pretask_cbs,
                 ray_posttask_cbs,
+                scoped_ray_remote_args,
             ),
             len(pool._pool),
             dsk,
@@ -115,7 +193,13 @@ def ray_dask_get(dsk, keys, **kwargs):
         # Ray tasks are done. Otherwise, no intermediate objects will be
         # cleaned up until all Ray tasks are done.
         del dsk
-        result = ray_get_unpack(object_refs)
+        if persist:
+            result = object_refs
+        else:
+            pb_actor = None
+            if enable_progress_bar:
+                pb_actor = ray.get_actor("_dask_on_ray_pb")
+            result = ray_get_unpack(object_refs, progress_bar_actor=pb_actor)
         if ray_finish_cbs is not None:
             for cb in ray_finish_cbs:
                 cb(result)
@@ -149,7 +233,9 @@ def _apply_async_wrapper(apply_async, real_func, *extra_args, **extra_kwargs):
         pass `real_func` in its place. To be passed to `dask.local.get_async`.
     """
 
-    def wrapper(func, args=(), kwds={}, callback=None):  # noqa: M511
+    def wrapper(func, args=(), kwds=None, callback=None):  # noqa: M511
+        if not kwds:
+            kwds = {}
         return apply_async(
             real_func,
             args=args + extra_args,
@@ -161,16 +247,17 @@ def _apply_async_wrapper(apply_async, real_func, *extra_args, **extra_kwargs):
 
 
 def _rayify_task_wrapper(
-        key,
-        task_info,
-        dumps,
-        loads,
-        get_id,
-        pack_exception,
-        ray_presubmit_cbs,
-        ray_postsubmit_cbs,
-        ray_pretask_cbs,
-        ray_posttask_cbs,
+    key,
+    task_info,
+    dumps,
+    loads,
+    get_id,
+    pack_exception,
+    ray_presubmit_cbs,
+    ray_postsubmit_cbs,
+    ray_pretask_cbs,
+    ray_posttask_cbs,
+    scoped_ray_remote_args,
 ):
     """
     The core Ray-Dask task execution wrapper, to be given to the thread pool's
@@ -189,6 +276,7 @@ def _rayify_task_wrapper(
         ray_postsubmit_cbs (callable): Post-task submission callbacks.
         ray_pretask_cbs (callable): Pre-task execution callbacks.
         ray_posttask_cbs (callable): Post-task execution callbacks.
+        scoped_ray_remote_args (dict): Ray task options for each key.
 
     Returns:
         A 3-tuple of the task's key, a literal or a Ray object reference for a
@@ -204,6 +292,7 @@ def _rayify_task_wrapper(
             ray_postsubmit_cbs,
             ray_pretask_cbs,
             ray_posttask_cbs,
+            scoped_ray_remote_args.get(key, {}),
         )
         id = get_id()
         result = dumps((result, id))
@@ -215,13 +304,14 @@ def _rayify_task_wrapper(
 
 
 def _rayify_task(
-        task,
-        key,
-        deps,
-        ray_presubmit_cbs,
-        ray_postsubmit_cbs,
-        ray_pretask_cbs,
-        ray_posttask_cbs,
+    task,
+    key,
+    deps,
+    ray_presubmit_cbs,
+    ray_postsubmit_cbs,
+    ray_pretask_cbs,
+    ray_posttask_cbs,
+    ray_remote_args,
 ):
     """
     Rayifies the given task, submitting it as a Ray task to the Ray cluster.
@@ -235,6 +325,7 @@ def _rayify_task(
         ray_postsubmit_cbs (callable): Post-task submission callbacks.
         ray_pretask_cbs (callable): Pre-task execution callbacks.
         ray_posttask_cbs (callable): Post-task execution callbacks.
+        ray_remote_args (dict): Ray task options.
 
     Returns:
         A literal, a Ray object reference representing a submitted task, or a
@@ -252,15 +343,15 @@ def _rayify_task(
                 ray_postsubmit_cbs,
                 ray_pretask_cbs,
                 ray_posttask_cbs,
-            ) for t in task
+                ray_remote_args,
+            )
+            for t in task
         ]
     elif istask(task):
         # Unpacks and repacks Ray object references and submits the task to the
         # Ray cluster for execution.
         if ray_presubmit_cbs is not None:
-            alternate_returns = [
-                cb(task, key, deps) for cb in ray_presubmit_cbs
-            ]
+            alternate_returns = [cb(task, key, deps) for cb in ray_presubmit_cbs]
             for alternate_return in alternate_returns:
                 # We don't submit a Ray task if a presubmit callback returns
                 # a non-`None` value, instead we return said value.
@@ -270,19 +361,33 @@ def _rayify_task(
                     return alternate_return
 
         func, args = task[0], task[1:]
+        if func is multiple_return_get:
+            return _execute_task(task, deps)
         # If the function's arguments contain nested object references, we must
         # unpack said object references into a flat set of arguments so that
         # Ray properly tracks the object dependencies between Ray tasks.
-        object_refs, repack = unpack_object_refs(args, deps)
+        arg_object_refs, repack = unpack_object_refs(args, deps)
         # Submit the task using a wrapper function.
-        object_ref = dask_task_wrapper.options(name=f"dask:{key!s}").remote(
-            func, repack, key, ray_pretask_cbs, ray_posttask_cbs, *object_refs)
+        object_refs = dask_task_wrapper.options(
+            name=f"dask:{key!s}",
+            num_returns=(
+                1 if not isinstance(func, MultipleReturnFunc) else func.num_returns
+            ),
+            **ray_remote_args,
+        ).remote(
+            func,
+            repack,
+            key,
+            ray_pretask_cbs,
+            ray_posttask_cbs,
+            *arg_object_refs,
+        )
 
         if ray_postsubmit_cbs is not None:
             for cb in ray_postsubmit_cbs:
-                cb(task, key, deps, object_ref)
+                cb(task, key, deps, object_refs)
 
-        return object_ref
+        return object_refs
     elif not ishashable(task):
         return task
     elif task in deps:
@@ -292,8 +397,7 @@ def _rayify_task(
 
 
 @ray.remote
-def dask_task_wrapper(func, repack, key, ray_pretask_cbs, ray_posttask_cbs,
-                      *args):
+def dask_task_wrapper(func, repack, key, ray_pretask_cbs, ray_posttask_cbs, *args):
     """
     A Ray remote function acting as a Dask task wrapper. This function will
     repackage the given flat `args` into its original data structures using
@@ -325,6 +429,7 @@ def dask_task_wrapper(func, repack, key, ray_pretask_cbs, ray_posttask_cbs,
     actual_args = [_execute_task(a, repacked_deps) for a in repacked_args]
     # Execute the actual underlying Dask task.
     result = func(*actual_args)
+
     if ray_posttask_cbs is not None:
         for cb, pre_state in zip(ray_posttask_cbs, pre_states):
             if cb is not None:
@@ -333,7 +438,39 @@ def dask_task_wrapper(func, repack, key, ray_pretask_cbs, ray_posttask_cbs,
     return result
 
 
-def ray_get_unpack(object_refs):
+def render_progress_bar(tracker, object_refs):
+    from tqdm import tqdm
+
+    # At this time, every task should be submitted.
+    total, finished = ray.get(tracker.result.remote())
+    reported_finished_so_far = 0
+    pb_bar = tqdm(total=total, position=0)
+    pb_bar.set_description("")
+
+    ready_refs = []
+
+    while finished < total:
+        submitted, finished = ray.get(tracker.result.remote())
+        pb_bar.update(finished - reported_finished_so_far)
+        reported_finished_so_far = finished
+        ready_refs, _ = ray.wait(
+            object_refs, timeout=0, num_returns=len(object_refs), fetch_local=False
+        )
+        if len(ready_refs) == len(object_refs):
+            break
+        import time
+
+        time.sleep(0.1)
+    pb_bar.close()
+    submitted, finished = ray.get(tracker.result.remote())
+    if submitted != finished:
+        print("Completed. There was state inconsistency.")
+    from pprint import pprint
+
+    pprint(ray.get(tracker.report.remote()))
+
+
+def ray_get_unpack(object_refs, progress_bar_actor=None):
     """
     Unpacks object references, gets the object references, and repacks.
     Traverses arbitrary data structures.
@@ -346,20 +483,27 @@ def ray_get_unpack(object_refs):
         The input Python object with all contained Ray object references
         resolved with their concrete values.
     """
+
+    def get_result(object_refs):
+        if progress_bar_actor:
+            render_progress_bar(progress_bar_actor, object_refs)
+        return ray.get(object_refs)
+
     if isinstance(object_refs, tuple):
         object_refs = list(object_refs)
 
-    if isinstance(object_refs, list) and any(not isinstance(x, ray.ObjectRef)
-                                             for x in object_refs):
+    if isinstance(object_refs, list) and any(
+        not isinstance(x, ray.ObjectRef) for x in object_refs
+    ):
         # We flatten the object references before calling ray.get(), since Dask
         # loves to nest collections in nested tuples and Ray expects a flat
         # list of object references. We repack the results after ray.get()
         # completes.
         object_refs, repack = unpack_object_refs(*object_refs)
-        computed_result = ray.get(object_refs)
+        computed_result = get_result(object_refs)
         return repack(computed_result)
     else:
-        return ray.get(object_refs)
+        return get_result(object_refs)
 
 
 def ray_dask_get_sync(dsk, keys, **kwargs):
@@ -393,6 +537,7 @@ def ray_dask_get_sync(dsk, keys, **kwargs):
     """
 
     ray_callbacks = kwargs.pop("ray_callbacks", None)
+    persist = kwargs.pop("ray_persist", False)
 
     with local_ray_callbacks(ray_callbacks) as ray_callbacks:
         # Unpack the Ray-specific callbacks.
@@ -428,9 +573,58 @@ def ray_dask_get_sync(dsk, keys, **kwargs):
         # Ray tasks are done. Otherwise, no intermediate objects will be
         # cleaned up until all Ray tasks are done.
         del dsk
-        result = ray_get_unpack(object_refs)
+        if persist:
+            result = object_refs
+        else:
+            result = ray_get_unpack(object_refs)
         if ray_finish_cbs is not None:
             for cb in ray_finish_cbs:
                 cb(result)
 
         return result
+
+
+@dataclass
+class MultipleReturnFunc:
+    func: callable
+    num_returns: int
+
+    def __call__(self, *args, **kwargs):
+        return self.func(*args, **kwargs)
+
+
+def multiple_return_get(multiple_returns, idx):
+    return multiple_returns[idx]
+
+
+def _build_key_scoped_ray_remote_args(dsk, annotations, ray_remote_args):
+    # Handle per-layer annotations.
+    if not isinstance(dsk, dask.highlevelgraph.HighLevelGraph):
+        dsk = dask.highlevelgraph.HighLevelGraph.from_collections(
+            id(dsk), dsk, dependencies=()
+        )
+    # Build key-scoped annotations.
+    scoped_annotations = {}
+    layers = [(name, dsk.layers[name]) for name in dsk._toposort_layers()]
+    for id_, layer in layers:
+        layer_annotations = layer.annotations
+        if layer_annotations is None:
+            layer_annotations = annotations
+        elif "resources" in layer_annotations:
+            raise ValueError(TOP_LEVEL_RESOURCES_ERR_MSG)
+        for key in layer.get_output_keys():
+            layer_annotations_for_key = annotations.copy()
+            # Layer annotations override global annotations.
+            layer_annotations_for_key.update(layer_annotations)
+            # Let same-key annotations earlier in the topological sort take precedence.
+            layer_annotations_for_key.update(scoped_annotations.get(key, {}))
+            scoped_annotations[key] = layer_annotations_for_key
+    # Build key-scoped Ray remote args.
+    scoped_ray_remote_args = {}
+    for key, annotations in scoped_annotations.items():
+        layer_ray_remote_args = ray_remote_args.copy()
+        # Layer Ray remote args override global Ray remote args given in the compute
+        # call.
+        layer_ray_remote_args.update(annotations.get("ray_remote_args", {}))
+        scoped_ray_remote_args[key] = layer_ray_remote_args
+    return scoped_ray_remote_args

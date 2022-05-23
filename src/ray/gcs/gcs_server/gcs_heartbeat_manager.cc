@@ -13,20 +13,23 @@
 // limitations under the License.
 
 #include "ray/gcs/gcs_server/gcs_heartbeat_manager.h"
+
+#include "ray/common/constants.h"
 #include "ray/common/ray_config.h"
 #include "ray/gcs/pb_util.h"
-#include "src/ray/protobuf/gcs.pb.h"
 
 namespace ray {
 namespace gcs {
 
 GcsHeartbeatManager::GcsHeartbeatManager(
-    boost::asio::io_service &io_service,
+    instrumented_io_context &io_service,
     std::function<void(const NodeID &)> on_node_death_callback)
     : io_service_(io_service),
       on_node_death_callback_(std::move(on_node_death_callback)),
       num_heartbeats_timeout_(RayConfig::instance().num_heartbeats_timeout()),
-      detect_timer_(io_service) {
+      periodical_runner_(io_service) {
+  RAY_LOG(INFO) << "GcsHeartbeatManager start, num_heartbeats_timeout="
+                << num_heartbeats_timeout_;
   io_service_thread_.reset(new std::thread([this] {
     SetThreadName("heartbeat");
     /// The asio work to keep io_service_ alive.
@@ -44,12 +47,17 @@ void GcsHeartbeatManager::Initialize(const GcsInitData &gcs_init_data) {
 }
 
 void GcsHeartbeatManager::Start() {
-  io_service_.post([this] {
-    if (!is_started_) {
-      Tick();
-      is_started_ = true;
-    }
-  });
+  io_service_.post(
+      [this] {
+        if (!is_started_) {
+          periodical_runner_.RunFnPeriodically(
+              [this] { DetectDeadNodes(); },
+              RayConfig::instance().raylet_heartbeat_period_milliseconds(),
+              "GcsHeartbeatManager.deadline_timer.detect_dead_nodes");
+          is_started_ = true;
+        }
+      },
+      "GcsHeartbeatManager.Start");
 }
 
 void GcsHeartbeatManager::Stop() {
@@ -61,18 +69,20 @@ void GcsHeartbeatManager::Stop() {
 
 void GcsHeartbeatManager::AddNode(const NodeID &node_id) {
   io_service_.post(
-      [this, node_id] { heartbeats_.emplace(node_id, num_heartbeats_timeout_); });
+      [this, node_id] { heartbeats_.emplace(node_id, num_heartbeats_timeout_); },
+      "GcsHeartbeatManager.AddNode");
 }
 
 void GcsHeartbeatManager::HandleReportHeartbeat(
-    const rpc::ReportHeartbeatRequest &request, rpc::ReportHeartbeatReply *reply,
+    const rpc::ReportHeartbeatRequest &request,
+    rpc::ReportHeartbeatReply *reply,
     rpc::SendReplyCallback send_reply_callback) {
   NodeID node_id = NodeID::FromBinary(request.heartbeat().node_id());
   auto iter = heartbeats_.find(node_id);
   if (iter == heartbeats_.end()) {
     // Reply the raylet with an error so the raylet can crash itself.
-    GCS_RPC_SEND_REPLY(send_reply_callback, reply,
-                       Status::Disconnected("Node has been dead"));
+    GCS_RPC_SEND_REPLY(
+        send_reply_callback, reply, Status::Disconnected("Node has been dead"));
     return;
   }
 
@@ -80,10 +90,11 @@ void GcsHeartbeatManager::HandleReportHeartbeat(
   GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
 }
 
-/// A periodic timer that checks for timed out clients.
-void GcsHeartbeatManager::Tick() {
-  DetectDeadNodes();
-  ScheduleTick();
+void GcsHeartbeatManager::HandleCheckAlive(const rpc::CheckAliveRequest &request,
+                                           rpc::CheckAliveReply *reply,
+                                           rpc::SendReplyCallback send_reply_callback) {
+  reply->set_ray_version(kRayVersion);
+  GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
 }
 
 void GcsHeartbeatManager::DetectDeadNodes() {
@@ -99,21 +110,6 @@ void GcsHeartbeatManager::DetectDeadNodes() {
       }
     }
   }
-}
-
-void GcsHeartbeatManager::ScheduleTick() {
-  auto heartbeat_period = boost::posix_time::milliseconds(
-      RayConfig::instance().raylet_heartbeat_timeout_milliseconds());
-  detect_timer_.expires_from_now(heartbeat_period);
-  detect_timer_.async_wait([this](const boost::system::error_code &error) {
-    if (error == boost::asio::error::operation_aborted) {
-      // `operation_aborted` is set when `detect_timer_` is canceled or destroyed.
-      // The Monitor lifetime may be short than the object who use it. (e.g. gcs_server)
-      return;
-    }
-    RAY_CHECK(!error) << "Checking heartbeat failed with error: " << error.message();
-    Tick();
-  });
 }
 
 }  // namespace gcs

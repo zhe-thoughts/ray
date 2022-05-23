@@ -15,10 +15,39 @@
 #include <thread>
 
 #include "gtest/gtest.h"
+#include "ray/common/asio/instrumented_io_context.h"
 #include "ray/common/test_util.h"
 #include "ray/core_worker/transport/direct_actor_transport.h"
 
 namespace ray {
+namespace core {
+
+class MockActorSchedulingQueue {
+ public:
+  MockActorSchedulingQueue(instrumented_io_context &main_io_service,
+                           DependencyWaiter &waiter)
+      : queue_(main_io_service, waiter) {}
+  void Add(int64_t seq_no,
+           int64_t client_processed_up_to,
+           std::function<void(rpc::SendReplyCallback)> accept_request,
+           std::function<void(rpc::SendReplyCallback)> reject_request,
+           rpc::SendReplyCallback send_reply_callback = nullptr,
+           TaskID task_id = TaskID::Nil(),
+           const std::vector<rpc::ObjectReference> &dependencies = {}) {
+    queue_.Add(seq_no,
+               client_processed_up_to,
+               std::move(accept_request),
+               std::move(reject_request),
+               send_reply_callback,
+               "",
+               FunctionDescriptorBuilder::Empty(),
+               task_id,
+               dependencies);
+  }
+
+ private:
+  ActorSchedulingQueue queue_;
+};
 
 class MockWaiter : public DependencyWaiter {
  public:
@@ -36,18 +65,17 @@ class MockWaiter : public DependencyWaiter {
 };
 
 TEST(SchedulingQueueTest, TestInOrder) {
-  boost::asio::io_service io_service;
+  instrumented_io_context io_service;
   MockWaiter waiter;
-  WorkerContext context(WorkerType::WORKER, WorkerID::FromRandom(), JobID::Nil());
-  ActorSchedulingQueue queue(io_service, waiter, context);
+  MockActorSchedulingQueue queue(io_service, waiter);
   int n_ok = 0;
   int n_rej = 0;
-  auto fn_ok = [&n_ok]() { n_ok++; };
-  auto fn_rej = [&n_rej]() { n_rej++; };
-  queue.Add(0, -1, fn_ok, fn_rej);
-  queue.Add(1, -1, fn_ok, fn_rej);
-  queue.Add(2, -1, fn_ok, fn_rej);
-  queue.Add(3, -1, fn_ok, fn_rej);
+  auto fn_ok = [&n_ok](rpc::SendReplyCallback callback) { n_ok++; };
+  auto fn_rej = [&n_rej](rpc::SendReplyCallback callback) { n_rej++; };
+  queue.Add(0, -1, fn_ok, fn_rej, nullptr);
+  queue.Add(1, -1, fn_ok, fn_rej, nullptr);
+  queue.Add(2, -1, fn_ok, fn_rej, nullptr);
+  queue.Add(3, -1, fn_ok, fn_rej, nullptr);
   io_service.run();
   ASSERT_EQ(n_ok, 4);
   ASSERT_EQ(n_rej, 0);
@@ -57,18 +85,19 @@ TEST(SchedulingQueueTest, TestWaitForObjects) {
   ObjectID obj1 = ObjectID::FromRandom();
   ObjectID obj2 = ObjectID::FromRandom();
   ObjectID obj3 = ObjectID::FromRandom();
-  boost::asio::io_service io_service;
+  instrumented_io_context io_service;
   MockWaiter waiter;
-  WorkerContext context(WorkerType::WORKER, WorkerID::FromRandom(), JobID::Nil());
-  ActorSchedulingQueue queue(io_service, waiter, context);
+  MockActorSchedulingQueue queue(io_service, waiter);
   int n_ok = 0;
   int n_rej = 0;
-  auto fn_ok = [&n_ok]() { n_ok++; };
-  auto fn_rej = [&n_rej]() { n_rej++; };
-  queue.Add(0, -1, fn_ok, fn_rej);
-  queue.Add(1, -1, fn_ok, fn_rej, ObjectIdsToRefs({obj1}));
-  queue.Add(2, -1, fn_ok, fn_rej, ObjectIdsToRefs({obj2}));
-  queue.Add(3, -1, fn_ok, fn_rej, ObjectIdsToRefs({obj3}));
+
+  auto fn_ok = [&n_ok](rpc::SendReplyCallback callback) { n_ok++; };
+  auto fn_rej = [&n_rej](rpc::SendReplyCallback callback) { n_rej++; };
+  queue.Add(0, -1, fn_ok, fn_rej, nullptr);
+  queue.Add(1, -1, fn_ok, fn_rej, nullptr, TaskID::Nil(), ObjectIdsToRefs({obj1}));
+  queue.Add(2, -1, fn_ok, fn_rej, nullptr, TaskID::Nil(), ObjectIdsToRefs({obj2}));
+  queue.Add(3, -1, fn_ok, fn_rej, nullptr, TaskID::Nil(), ObjectIdsToRefs({obj3}));
+
   ASSERT_EQ(n_ok, 1);
 
   waiter.Complete(0);
@@ -83,16 +112,17 @@ TEST(SchedulingQueueTest, TestWaitForObjects) {
 
 TEST(SchedulingQueueTest, TestWaitForObjectsNotSubjectToSeqTimeout) {
   ObjectID obj1 = ObjectID::FromRandom();
-  boost::asio::io_service io_service;
+  instrumented_io_context io_service;
   MockWaiter waiter;
-  WorkerContext context(WorkerType::WORKER, WorkerID::FromRandom(), JobID::Nil());
-  ActorSchedulingQueue queue(io_service, waiter, context);
+  MockActorSchedulingQueue queue(io_service, waiter);
   int n_ok = 0;
   int n_rej = 0;
-  auto fn_ok = [&n_ok]() { n_ok++; };
-  auto fn_rej = [&n_rej]() { n_rej++; };
-  queue.Add(0, -1, fn_ok, fn_rej);
-  queue.Add(1, -1, fn_ok, fn_rej, ObjectIdsToRefs({obj1}));
+
+  auto fn_ok = [&n_ok](rpc::SendReplyCallback callback) { n_ok++; };
+  auto fn_rej = [&n_rej](rpc::SendReplyCallback callback) { n_rej++; };
+  queue.Add(0, -1, fn_ok, fn_rej, nullptr);
+  queue.Add(1, -1, fn_ok, fn_rej, nullptr, TaskID::Nil(), ObjectIdsToRefs({obj1}));
+
   ASSERT_EQ(n_ok, 1);
   io_service.run();
   ASSERT_EQ(n_rej, 0);
@@ -101,63 +131,80 @@ TEST(SchedulingQueueTest, TestWaitForObjectsNotSubjectToSeqTimeout) {
 }
 
 TEST(SchedulingQueueTest, TestOutOfOrder) {
-  boost::asio::io_service io_service;
+  instrumented_io_context io_service;
   MockWaiter waiter;
-  WorkerContext context(WorkerType::WORKER, WorkerID::FromRandom(), JobID::Nil());
-  ActorSchedulingQueue queue(io_service, waiter, context);
+  MockActorSchedulingQueue queue(io_service, waiter);
   int n_ok = 0;
   int n_rej = 0;
-  auto fn_ok = [&n_ok]() { n_ok++; };
-  auto fn_rej = [&n_rej]() { n_rej++; };
-  queue.Add(2, -1, fn_ok, fn_rej);
-  queue.Add(0, -1, fn_ok, fn_rej);
-  queue.Add(3, -1, fn_ok, fn_rej);
-  queue.Add(1, -1, fn_ok, fn_rej);
+  auto fn_ok = [&n_ok](rpc::SendReplyCallback callback) { n_ok++; };
+  auto fn_rej = [&n_rej](rpc::SendReplyCallback callback) { n_rej++; };
+  queue.Add(2, -1, fn_ok, fn_rej, nullptr);
+  queue.Add(0, -1, fn_ok, fn_rej, nullptr);
+  queue.Add(3, -1, fn_ok, fn_rej, nullptr);
+  queue.Add(1, -1, fn_ok, fn_rej, nullptr);
   io_service.run();
   ASSERT_EQ(n_ok, 4);
   ASSERT_EQ(n_rej, 0);
 }
 
 TEST(SchedulingQueueTest, TestSeqWaitTimeout) {
-  boost::asio::io_service io_service;
+  instrumented_io_context io_service;
   MockWaiter waiter;
-  WorkerContext context(WorkerType::WORKER, WorkerID::FromRandom(), JobID::Nil());
-  ActorSchedulingQueue queue(io_service, waiter, context);
+  MockActorSchedulingQueue queue(io_service, waiter);
   int n_ok = 0;
   int n_rej = 0;
-  auto fn_ok = [&n_ok]() { n_ok++; };
-  auto fn_rej = [&n_rej]() { n_rej++; };
-  queue.Add(2, -1, fn_ok, fn_rej);
-  queue.Add(0, -1, fn_ok, fn_rej);
-  queue.Add(3, -1, fn_ok, fn_rej);
+  auto fn_ok = [&n_ok](rpc::SendReplyCallback callback) { n_ok++; };
+  auto fn_rej = [&n_rej](rpc::SendReplyCallback callback) { n_rej++; };
+  queue.Add(2, -1, fn_ok, fn_rej, nullptr);
+  queue.Add(0, -1, fn_ok, fn_rej, nullptr);
+  queue.Add(3, -1, fn_ok, fn_rej, nullptr);
   ASSERT_EQ(n_ok, 1);
   ASSERT_EQ(n_rej, 0);
   io_service.run();  // immediately triggers timeout
   ASSERT_EQ(n_ok, 1);
   ASSERT_EQ(n_rej, 2);
-  queue.Add(4, -1, fn_ok, fn_rej);
-  queue.Add(5, -1, fn_ok, fn_rej);
+  queue.Add(4, -1, fn_ok, fn_rej, nullptr);
+  queue.Add(5, -1, fn_ok, fn_rej, nullptr);
   ASSERT_EQ(n_ok, 3);
   ASSERT_EQ(n_rej, 2);
 }
 
 TEST(SchedulingQueueTest, TestSkipAlreadyProcessedByClient) {
-  boost::asio::io_service io_service;
+  instrumented_io_context io_service;
   MockWaiter waiter;
-  WorkerContext context(WorkerType::WORKER, WorkerID::FromRandom(), JobID::Nil());
-  ActorSchedulingQueue queue(io_service, waiter, context);
+  MockActorSchedulingQueue queue(io_service, waiter);
   int n_ok = 0;
   int n_rej = 0;
-  auto fn_ok = [&n_ok]() { n_ok++; };
-  auto fn_rej = [&n_rej]() { n_rej++; };
-  queue.Add(2, 2, fn_ok, fn_rej);
-  queue.Add(3, 2, fn_ok, fn_rej);
-  queue.Add(1, 2, fn_ok, fn_rej);
+  auto fn_ok = [&n_ok](rpc::SendReplyCallback callback) { n_ok++; };
+  auto fn_rej = [&n_rej](rpc::SendReplyCallback callback) { n_rej++; };
+  queue.Add(2, 2, fn_ok, fn_rej, nullptr);
+  queue.Add(3, 2, fn_ok, fn_rej, nullptr);
+  queue.Add(1, 2, fn_ok, fn_rej, nullptr);
   io_service.run();
   ASSERT_EQ(n_ok, 1);
   ASSERT_EQ(n_rej, 2);
 }
 
+TEST(SchedulingQueueTest, TestCancelQueuedTask) {
+  std::unique_ptr<SchedulingQueue> queue = std::make_unique<NormalSchedulingQueue>();
+  ASSERT_TRUE(queue->TaskQueueEmpty());
+  int n_ok = 0;
+  int n_rej = 0;
+  auto fn_ok = [&n_ok](rpc::SendReplyCallback callback) { n_ok++; };
+  auto fn_rej = [&n_rej](rpc::SendReplyCallback callback) { n_rej++; };
+  queue->Add(-1, -1, fn_ok, fn_rej, nullptr, "", FunctionDescriptorBuilder::Empty());
+  queue->Add(-1, -1, fn_ok, fn_rej, nullptr, "", FunctionDescriptorBuilder::Empty());
+  queue->Add(-1, -1, fn_ok, fn_rej, nullptr, "", FunctionDescriptorBuilder::Empty());
+  queue->Add(-1, -1, fn_ok, fn_rej, nullptr, "", FunctionDescriptorBuilder::Empty());
+  queue->Add(-1, -1, fn_ok, fn_rej, nullptr, "", FunctionDescriptorBuilder::Empty());
+  ASSERT_TRUE(queue->CancelTaskIfFound(TaskID::Nil()));
+  ASSERT_FALSE(queue->TaskQueueEmpty());
+  queue->ScheduleRequests();
+  ASSERT_EQ(n_ok, 4);
+  ASSERT_EQ(n_rej, 1);
+}
+
+}  // namespace core
 }  // namespace ray
 
 int main(int argc, char **argv) {

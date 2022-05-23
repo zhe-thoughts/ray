@@ -1,10 +1,12 @@
 import logging
 import threading
+import traceback
 
 import ray.cloudpickle as pickle
 from ray import ray_constants
-import ray.utils
-from ray.gcs_utils import ErrorType
+import ray._private.utils
+from ray._private.gcs_utils import ErrorType
+from ray.core.generated.common_pb2 import RayErrorInfo
 from ray.exceptions import (
     RayError,
     PlasmaObjectNotAvailable,
@@ -13,6 +15,19 @@ from ray.exceptions import (
     TaskCancelledError,
     WorkerCrashedError,
     ObjectLostError,
+    ObjectFetchTimedOutError,
+    ReferenceCountingAssertionError,
+    OwnerDiedError,
+    ObjectReconstructionFailedError,
+    ObjectReconstructionFailedMaxAttemptsExceededError,
+    ObjectReconstructionFailedLineageEvictedError,
+    RaySystemError,
+    RuntimeEnvSetupError,
+    TaskPlacementGroupRemoved,
+    ActorPlacementGroupRemoved,
+    LocalRayletDiedError,
+    TaskUnschedulableError,
+    ActorUnschedulableError,
 )
 from ray._raylet import (
     split_buffer,
@@ -23,6 +38,7 @@ from ray._raylet import (
     MessagePackSerializedObject,
     RawSerializedObject,
 )
+from ray import serialization_addons
 
 logger = logging.getLogger(__name__)
 
@@ -31,18 +47,16 @@ class DeserializationError(Exception):
     pass
 
 
-def object_ref_deserializer(reduced_obj_ref, owner_address):
+def _object_ref_deserializer(binary, call_site, owner_address, object_status):
     # NOTE(suquark): This function should be a global function so
-    # cloudpickle can access it directly. Otherwise couldpickle
+    # cloudpickle can access it directly. Otherwise cloudpickle
     # has to dump the whole function definition, which is inefficient.
 
     # NOTE(swang): Must deserialize the object first before asking
     # the core worker to resolve the value. This is to make sure
     # that the ref count for the ObjectRef is greater than 0 by the
     # time the core worker resolves the value of the object.
-
-    # UniqueIDs are serialized as (class name, (unique bytes,)).
-    obj_ref = reduced_obj_ref[0](*reduced_obj_ref[1])
+    obj_ref = ray.ObjectRef(binary, owner_address, call_site)
 
     # TODO(edoakes): we should be able to just capture a reference
     # to 'self' here instead, but this function is itself pickled
@@ -57,17 +71,17 @@ def object_ref_deserializer(reduced_obj_ref, owner_address):
         if outer_id is None:
             outer_id = ray.ObjectRef.nil()
         worker.core_worker.deserialize_and_register_object_ref(
-            obj_ref.binary(), outer_id, owner_address)
+            obj_ref.binary(), outer_id, owner_address, object_status
+        )
     return obj_ref
 
 
-def actor_handle_deserializer(serialized_obj):
+def _actor_handle_deserializer(serialized_obj):
     # If this actor handle was stored in another object, then tell the
     # core worker.
     context = ray.worker.global_worker.get_serialization_context()
     outer_id = context.get_outer_object_ref()
-    return ray.actor.ActorHandle._deserialization_helper(
-        serialized_obj, outer_id)
+    return ray.actor.ActorHandle._deserialization_helper(serialized_obj, outer_id)
 
 
 class SerializationContext:
@@ -82,31 +96,42 @@ class SerializationContext:
         self._thread_local = threading.local()
 
         def actor_handle_reducer(obj):
+            ray.worker.global_worker.check_connected()
             serialized, actor_handle_id = obj._serialization_helper()
             # Update ref counting for the actor handle
             self.add_contained_object_ref(actor_handle_id)
-            return actor_handle_deserializer, (serialized, )
+            return _actor_handle_deserializer, (serialized,)
 
-        self._register_cloudpickle_reducer(ray.actor.ActorHandle,
-                                           actor_handle_reducer)
+        self._register_cloudpickle_reducer(ray.actor.ActorHandle, actor_handle_reducer)
 
         def object_ref_reducer(obj):
-            self.add_contained_object_ref(obj)
             worker = ray.worker.global_worker
             worker.check_connected()
-            obj, owner_address = (
-                worker.core_worker.serialize_and_promote_object_ref(obj))
-            return object_ref_deserializer, (obj.__reduce__(), owner_address)
+            self.add_contained_object_ref(obj)
+            obj, owner_address, object_status = worker.core_worker.serialize_object_ref(
+                obj
+            )
+            return _object_ref_deserializer, (
+                obj.binary(),
+                obj.call_site(),
+                owner_address,
+                object_status,
+            )
 
         self._register_cloudpickle_reducer(ray.ObjectRef, object_ref_reducer)
+        serialization_addons.apply(self)
 
     def _register_cloudpickle_reducer(self, cls, reducer):
         pickle.CloudPickler.dispatch[cls] = reducer
 
-    def _register_cloudpickle_serializer(self, cls, custom_serializer,
-                                         custom_deserializer):
+    def _unregister_cloudpickle_reducer(self, cls):
+        pickle.CloudPickler.dispatch.pop(cls, None)
+
+    def _register_cloudpickle_serializer(
+        self, cls, custom_serializer, custom_deserializer
+    ):
         def _CloudPicklerReducer(obj):
-            return custom_deserializer, (custom_serializer(obj), )
+            return custom_deserializer, (custom_serializer(obj),)
 
         # construct a reducer
         pickle.CloudPickler.dispatch[cls] = _CloudPicklerReducer
@@ -120,11 +145,9 @@ class SerializationContext:
     def set_out_of_band_serialization(self):
         self._thread_local.in_band = False
 
-    def set_outer_object_ref(self, outer_object_ref):
-        self._thread_local.outer_object_ref = outer_object_ref
-
     def get_outer_object_ref(self):
-        return getattr(self._thread_local, "outer_object_ref", None)
+        stack = getattr(self._thread_local, "object_ref_stack", [])
+        return stack[-1] if stack else None
 
     def get_and_clear_contained_object_refs(self):
         if not hasattr(self._thread_local, "object_refs"):
@@ -148,8 +171,7 @@ class SerializationContext:
             # cloudpickle directly or captured in a remote function/actor),
             # then pin the object for the lifetime of this worker by adding
             # a local reference that won't ever be removed.
-            ray.worker.global_worker.core_worker.add_object_ref_reference(
-                object_ref)
+            ray.worker.global_worker.core_worker.add_object_ref_reference(object_ref)
 
     def _deserialize_pickle5_data(self, data):
         try:
@@ -176,18 +198,41 @@ class SerializationContext:
             def _python_deserializer(index):
                 return python_objects[index]
 
-            obj = MessagePackSerializer.loads(msgpack_data,
-                                              _python_deserializer)
+            obj = MessagePackSerializer.loads(msgpack_data, _python_deserializer)
         except Exception:
             raise DeserializationError()
         return obj
+
+    def _deserialize_error_info(self, data, metadata_fields):
+        assert data
+        pb_bytes = self._deserialize_msgpack_data(data, metadata_fields)
+        assert pb_bytes
+
+        ray_error_info = RayErrorInfo()
+        ray_error_info.ParseFromString(pb_bytes)
+        return ray_error_info
+
+    def _deserialize_actor_died_error(self, data, metadata_fields):
+        if not data:
+            return RayActorError()
+        ray_error_info = self._deserialize_error_info(data, metadata_fields)
+        assert ray_error_info.HasField("actor_died_error")
+        if ray_error_info.actor_died_error.HasField("creation_task_failure_context"):
+            return RayError.from_ray_exception(
+                ray_error_info.actor_died_error.creation_task_failure_context
+            )
+        else:
+            assert ray_error_info.actor_died_error.HasField("actor_died_error_context")
+            return RayActorError(
+                cause=ray_error_info.actor_died_error.actor_died_error_context
+            )
 
     def _deserialize_object(self, data, metadata, object_ref):
         if metadata:
             metadata_fields = metadata.split(b",")
             if metadata_fields[0] in [
-                    ray_constants.OBJECT_METADATA_TYPE_CROSS_LANGUAGE,
-                    ray_constants.OBJECT_METADATA_TYPE_PYTHON
+                ray_constants.OBJECT_METADATA_TYPE_CROSS_LANGUAGE,
+                ray_constants.OBJECT_METADATA_TYPE_PYTHON,
             ]:
                 return self._deserialize_msgpack_data(data, metadata_fields)
             # Check if the object should be returned as raw bytes.
@@ -195,17 +240,17 @@ class SerializationContext:
                 if data is None:
                     return b""
                 return data.to_pybytes()
-            elif metadata_fields[
-                    0] == ray_constants.OBJECT_METADATA_TYPE_ACTOR_HANDLE:
+            elif metadata_fields[0] == ray_constants.OBJECT_METADATA_TYPE_ACTOR_HANDLE:
                 obj = self._deserialize_msgpack_data(data, metadata_fields)
-                return actor_handle_deserializer(obj)
+                return _actor_handle_deserializer(obj)
             # Otherwise, return an exception object based on
             # the error type.
             try:
                 error_type = int(metadata_fields[0])
             except Exception:
-                raise Exception(f"Can't deserialize object: {object_ref}, "
-                                f"metadata: {metadata}")
+                raise Exception(
+                    f"Can't deserialize object: {object_ref}, " f"metadata: {metadata}"
+                )
 
             # RayTaskError is serialized with pickle5 in the data field.
             # TODO (kfstorm): exception serialization should be language
@@ -216,15 +261,62 @@ class SerializationContext:
             elif error_type == ErrorType.Value("WORKER_DIED"):
                 return WorkerCrashedError()
             elif error_type == ErrorType.Value("ACTOR_DIED"):
-                return RayActorError()
+                return self._deserialize_actor_died_error(data, metadata_fields)
+            elif error_type == ErrorType.Value("LOCAL_RAYLET_DIED"):
+                return LocalRayletDiedError()
             elif error_type == ErrorType.Value("TASK_CANCELLED"):
                 return TaskCancelledError()
+            elif error_type == ErrorType.Value("OBJECT_LOST"):
+                return ObjectLostError(
+                    object_ref.hex(), object_ref.owner_address(), object_ref.call_site()
+                )
+            elif error_type == ErrorType.Value("OBJECT_FETCH_TIMED_OUT"):
+                return ObjectFetchTimedOutError(
+                    object_ref.hex(), object_ref.owner_address(), object_ref.call_site()
+                )
+            elif error_type == ErrorType.Value("OBJECT_DELETED"):
+                return ReferenceCountingAssertionError(
+                    object_ref.hex(), object_ref.owner_address(), object_ref.call_site()
+                )
+            elif error_type == ErrorType.Value("OWNER_DIED"):
+                return OwnerDiedError(
+                    object_ref.hex(), object_ref.owner_address(), object_ref.call_site()
+                )
             elif error_type == ErrorType.Value("OBJECT_UNRECONSTRUCTABLE"):
-                return ObjectLostError(ray.ObjectRef(object_ref.binary()))
+                return ObjectReconstructionFailedError(
+                    object_ref.hex(), object_ref.owner_address(), object_ref.call_site()
+                )
+            elif error_type == ErrorType.Value(
+                "OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED"
+            ):
+                return ObjectReconstructionFailedMaxAttemptsExceededError(
+                    object_ref.hex(), object_ref.owner_address(), object_ref.call_site()
+                )
+            elif error_type == ErrorType.Value(
+                "OBJECT_UNRECONSTRUCTABLE_LINEAGE_EVICTED"
+            ):
+                return ObjectReconstructionFailedLineageEvictedError(
+                    object_ref.hex(), object_ref.owner_address(), object_ref.call_site()
+                )
+            elif error_type == ErrorType.Value("RUNTIME_ENV_SETUP_FAILED"):
+                error_info = self._deserialize_error_info(data, metadata_fields)
+                # TODO(sang): Assert instead once actor also reports error messages.
+                error_msg = ""
+                if error_info.HasField("runtime_env_setup_failed_error"):
+                    error_msg = error_info.runtime_env_setup_failed_error.error_message
+                return RuntimeEnvSetupError(error_message=error_msg)
+            elif error_type == ErrorType.Value("TASK_PLACEMENT_GROUP_REMOVED"):
+                return TaskPlacementGroupRemoved()
+            elif error_type == ErrorType.Value("ACTOR_PLACEMENT_GROUP_REMOVED"):
+                return ActorPlacementGroupRemoved()
+            elif error_type == ErrorType.Value("TASK_UNSCHEDULABLE_ERROR"):
+                error_info = self._deserialize_error_info(data, metadata_fields)
+                return TaskUnschedulableError(error_info.error_message)
+            elif error_type == ErrorType.Value("ACTOR_UNSCHEDULABLE_ERROR"):
+                error_info = self._deserialize_error_info(data, metadata_fields)
+                return ActorUnschedulableError(error_info.error_message)
             else:
-                assert error_type != ErrorType.Value("OBJECT_IN_PLASMA"), \
-                    "Tried to get object that has been promoted to plasma."
-                assert False, "Unrecognized error type " + str(error_type)
+                return RaySystemError("Unrecognized error type " + str(error_type))
         elif data:
             raise ValueError("non-null object should always have metadata")
         else:
@@ -236,15 +328,24 @@ class SerializationContext:
 
     def deserialize_objects(self, data_metadata_pairs, object_refs):
         assert len(data_metadata_pairs) == len(object_refs)
+        # initialize the thread-local field
+        if not hasattr(self._thread_local, "object_ref_stack"):
+            self._thread_local.object_ref_stack = []
         results = []
-        for object_ref, (data, metadata) in zip(object_refs,
-                                                data_metadata_pairs):
-            assert self.get_outer_object_ref() is None
-            self.set_outer_object_ref(object_ref)
-            results.append(
-                self._deserialize_object(data, metadata, object_ref))
-            # Must clear ObjectRef to not hold a reference.
-            self.set_outer_object_ref(None)
+        for object_ref, (data, metadata) in zip(object_refs, data_metadata_pairs):
+            try:
+                # Push the object ref to the stack, so the object under
+                # the object ref knows where it comes from.
+                self._thread_local.object_ref_stack.append(object_ref)
+                obj = self._deserialize_object(data, metadata, object_ref)
+            except Exception as e:
+                logger.exception(e)
+                obj = RaySystemError(e, traceback.format_exc())
+            finally:
+                # Must clear ObjectRef to not hold a reference.
+                if self._thread_local.object_ref_stack:
+                    self._thread_local.object_ref_stack.pop()
+            results.append(obj)
         return results
 
     def _serialize_to_pickle5(self, metadata, value):
@@ -253,7 +354,8 @@ class SerializationContext:
         try:
             self.set_in_band_serialization()
             inband = pickle.dumps(
-                value, protocol=5, buffer_callback=writer.buffer_callback)
+                value, protocol=5, buffer_callback=writer.buffer_callback
+            )
         except Exception as e:
             self.get_and_clear_contained_object_refs()
             raise e
@@ -261,8 +363,8 @@ class SerializationContext:
             self.set_out_of_band_serialization()
 
         return Pickle5SerializedObject(
-            metadata, inband, writer,
-            self.get_and_clear_contained_object_refs())
+            metadata, inband, writer, self.get_and_clear_contained_object_refs()
+        )
 
     def _serialize_to_msgpack(self, value):
         # Only RayTaskError is possible to be serialized here. We don't
@@ -270,8 +372,7 @@ class SerializationContext:
         contained_object_refs = []
 
         if isinstance(value, RayTaskError):
-            metadata = str(
-                ErrorType.Value("TASK_EXECUTION_EXCEPTION")).encode("ascii")
+            metadata = str(ErrorType.Value("TASK_EXECUTION_EXCEPTION")).encode("ascii")
             value = value.to_bytes()
         elif isinstance(value, ray.actor.ActorHandle):
             # TODO(fyresone): ActorHandle should be serialized via the
@@ -295,14 +396,15 @@ class SerializationContext:
 
         if python_objects:
             metadata = ray_constants.OBJECT_METADATA_TYPE_PYTHON
-            pickle5_serialized_object = \
-                self._serialize_to_pickle5(metadata, python_objects)
+            pickle5_serialized_object = self._serialize_to_pickle5(
+                metadata, python_objects
+            )
         else:
             pickle5_serialized_object = None
 
-        return MessagePackSerializedObject(metadata, msgpack_data,
-                                           contained_object_refs,
-                                           pickle5_serialized_object)
+        return MessagePackSerializedObject(
+            metadata, msgpack_data, contained_object_refs, pickle5_serialized_object
+        )
 
     def serialize(self, value):
         """Serialize an object.

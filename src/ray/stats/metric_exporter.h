@@ -14,9 +14,11 @@
 
 #pragma once
 #include <boost/asio.hpp>
+
 #include "absl/memory/memory.h"
 #include "opencensus/stats/stats.h"
 #include "opencensus/tags/tag_key.h"
+#include "ray/common/asio/instrumented_io_context.h"
 #include "ray/rpc/client_call.h"
 #include "ray/stats/metric.h"
 #include "ray/stats/metric_exporter_client.h"
@@ -61,7 +63,8 @@ class MetricPointExporter final : public opencensus::stats::StatsExporter::Handl
   /// \param points, memory metric vector instance
   void ExportToPoints(const opencensus::stats::ViewData::DataMap<DTYPE> &view_data,
                       const opencensus::stats::MeasureDescriptor &measure_descriptor,
-                      std::vector<std::string> &keys, std::vector<MetricPoint> &points) {
+                      std::vector<std::string> &keys,
+                      std::vector<MetricPoint> &points) {
     const auto &metric_name = measure_descriptor.name();
     for (const auto &row : view_data) {
       std::unordered_map<std::string, std::string> tags;
@@ -69,8 +72,11 @@ class MetricPointExporter final : public opencensus::stats::StatsExporter::Handl
         tags[keys[i]] = row.first[i];
       }
       // Current timestamp is used for point not view data time.
-      MetricPoint point{metric_name, current_sys_time_ms(),
-                        static_cast<double>(row.second), tags, measure_descriptor};
+      MetricPoint point{metric_name,
+                        current_sys_time_ms(),
+                        static_cast<double>(row.second),
+                        tags,
+                        measure_descriptor};
       points.push_back(std::move(point));
       if (points.size() >= report_batch_size_) {
         metric_exporter_client_->ReportMetrics(points);
@@ -88,12 +94,14 @@ class MetricPointExporter final : public opencensus::stats::StatsExporter::Handl
 
 class OpenCensusProtoExporter final : public opencensus::stats::StatsExporter::Handler {
  public:
-  OpenCensusProtoExporter(const int port, boost::asio::io_service &io_service,
+  OpenCensusProtoExporter(const int port,
+                          instrumented_io_context &io_service,
                           const std::string address);
 
   ~OpenCensusProtoExporter() = default;
 
-  static void Register(const int port, boost::asio::io_service &io_service,
+  static void Register(const int port,
+                       instrumented_io_context &io_service,
                        const std::string address) {
     opencensus::stats::StatsExporter::RegisterPushHandler(
         absl::make_unique<OpenCensusProtoExporter>(port, io_service, address));

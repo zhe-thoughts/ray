@@ -1,21 +1,33 @@
-import asyncio
-import os
 import json
-from copy import deepcopy
-
+import tempfile
 import numpy as np
+import os
+import sys
+import subprocess
 import pytest
 
+from fastapi.encoders import jsonable_encoder
+
 import ray
-from ray.serve.utils import (ServeEncoder, chain_future, unpack_future,
-                             try_schedule_resources_on_nodes,
-                             get_conda_env_dir, import_class)
+from ray import serve
+from ray.serve.utils import (
+    serve_encoders,
+    get_deployment_import_path,
+    node_id_to_ip_addr,
+)
+
+
+def test_node_id_to_ip_addr():
+    assert node_id_to_ip_addr("node:127.0.0.1-0") == "127.0.0.1"
+    assert node_id_to_ip_addr("127.0.0.1-0") == "127.0.0.1"
+    assert node_id_to_ip_addr("127.0.0.1") == "127.0.0.1"
+    assert node_id_to_ip_addr("node:127.0.0.1") == "127.0.0.1"
 
 
 def test_bytes_encoder():
     data_before = {"inp": {"nest": b"bytes"}}
     data_after = {"inp": {"nest": "bytes"}}
-    assert json.loads(json.dumps(data_before, cls=ServeEncoder)) == data_after
+    assert json.loads(json.dumps(jsonable_encoder(data_before))) == data_after
 
 
 def test_numpy_encoding():
@@ -23,124 +35,114 @@ def test_numpy_encoding():
     floats = np.array(data).astype(np.float32)
     ints = floats.astype(np.int32)
     uints = floats.astype(np.uint32)
+    list_of_uints = [np.int64(1), np.int64(2)]
 
-    assert json.loads(json.dumps(floats, cls=ServeEncoder)) == data
-    assert json.loads(json.dumps(ints, cls=ServeEncoder)) == data
-    assert json.loads(json.dumps(uints, cls=ServeEncoder)) == data
-
-
-@pytest.mark.asyncio
-async def test_future_chaining():
-    def make():
-        return asyncio.get_event_loop().create_future()
-
-    # Test 1 -> 1 chaining
-    fut1, fut2 = make(), make()
-    chain_future(fut1, fut2)
-    fut1.set_result(1)
-    assert await fut2 == 1
-
-    # Test 1 -> 1 chaining with exception
-    fut1, fut2 = make(), make()
-    chain_future(fut1, fut2)
-    fut1.set_exception(ValueError(""))
-    with pytest.raises(ValueError):
-        await fut2
-
-    # Test many -> many chaining
-    src_futs = [make() for _ in range(4)]
-    dst_futs = [make() for _ in range(4)]
-    chain_future(src_futs, dst_futs)
-    [fut.set_result(i) for i, fut in enumerate(src_futs)]
-    for i, fut in enumerate(dst_futs):
-        assert await fut == i
-
-    # Test 1 -> many unwrapping
-    batched_future = make()
-    single_futures = unpack_future(batched_future, 4)
-    batched_future.set_result(list(range(4)))
-    for i, fut in enumerate(single_futures):
-        assert await fut == i
-
-    # Test 1 -> many unwrapping with exception
-    batched_future = make()
-    single_futures = unpack_future(batched_future, 4)
-    batched_future.set_exception(ValueError(""))
-    for future in single_futures:
-        with pytest.raises(ValueError):
-            await future
+    for np_data in [floats, ints, uints, list_of_uints]:
+        assert (
+            json.loads(
+                json.dumps(jsonable_encoder(np_data, custom_encoder=serve_encoders))
+            )
+            == data
+        )
+    nested = {"a": np.array([1, 2])}
+    assert json.loads(
+        json.dumps(jsonable_encoder(nested, custom_encoder=serve_encoders))
+    ) == {"a": [1, 2]}
 
 
-def test_mock_scheduler():
-    ray_nodes = {
-        "AAA": {
-            "CPU": 2.0,
-            "GPU": 2.0
-        },
-        "BBB": {
-            "CPU": 4.0,
-        }
-    }
-
-    assert try_schedule_resources_on_nodes(
-        [
-            {
-                "CPU": 2,
-                "GPU": 2
-            },  # node 1
-            {
-                "CPU": 4
-            }  # node 2
-        ],
-        deepcopy(ray_nodes)) == [True, True]
-
-    assert try_schedule_resources_on_nodes([
-        {
-            "CPU": 100
-        },
-        {
-            "GPU": 1
-        },
-    ], deepcopy(ray_nodes)) == [False, True]
-
-    assert try_schedule_resources_on_nodes(
-        [
-            {
-                "CPU": 6
-            },  # Equals to the sum of cpus but shouldn't be scheduable.
-        ],
-        deepcopy(ray_nodes)) == [False]
+@serve.deployment
+def decorated_f(*args):
+    return "reached decorated_f"
 
 
-def test_get_conda_env_dir(tmp_path):
-    d = tmp_path / "tf1"
-    d.mkdir()
-    os.environ["CONDA_PREFIX"] = str(d)
-    with pytest.raises(ValueError):
-        # env does not exist
-        env_dir = get_conda_env_dir("tf2")
-    tf2_dir = tmp_path / "tf2"
-    tf2_dir.mkdir()
-    env_dir = get_conda_env_dir("tf2")
-    assert (env_dir == str(tmp_path / "tf2"))
-    os.environ["CONDA_PREFIX"] = ""
+@ray.remote
+class DecoratedActor:
+    def __call__(self, *args):
+        return "reached decorated_actor"
 
 
-def test_import_class():
-    assert import_class("ray.serve.Client") == ray.serve.api.Client
-    assert import_class("ray.serve.api.Client") == ray.serve.api.Client
+def gen_func():
+    @serve.deployment
+    def f():
+        pass
 
-    policy_cls = import_class("ray.serve.controller.TrafficPolicy")
-    assert policy_cls == ray.serve.controller.TrafficPolicy
+    return f
 
-    policy = policy_cls({"endpoint1": 0.5, "endpoint2": 0.5})
-    with pytest.raises(ValueError):
-        policy.set_traffic_dict({"endpoint1": 0.5, "endpoint2": 0.6})
-    policy.set_traffic_dict({"endpoint1": 0.4, "endpoint2": 0.6})
 
-    print(repr(policy))
+def gen_class():
+    @serve.deployment
+    class A:
+        pass
+
+    return A
+
+
+class TestGetDeploymentImportPath:
+    def test_invalid_inline_defined(self):
+        @serve.deployment
+        def inline_f():
+            pass
+
+        with pytest.raises(RuntimeError, match="must be importable"):
+            get_deployment_import_path(inline_f, enforce_importable=True)
+
+        with pytest.raises(RuntimeError, match="must be importable"):
+            get_deployment_import_path(gen_func(), enforce_importable=True)
+
+        @serve.deployment
+        class InlineCls:
+            pass
+
+        with pytest.raises(RuntimeError, match="must be importable"):
+            get_deployment_import_path(InlineCls, enforce_importable=True)
+
+        with pytest.raises(RuntimeError, match="must be importable"):
+            get_deployment_import_path(gen_class(), enforce_importable=True)
+
+    def test_get_import_path_basic(self):
+        d = decorated_f.options()
+
+        # CI may change the parent path, so check only that the suffix matches.
+        assert get_deployment_import_path(d).endswith(
+            "ray.serve.tests.test_util.decorated_f"
+        )
+
+    def test_get_import_path_nested_actor(self):
+        d = serve.deployment(name="actor")(DecoratedActor)
+
+        # CI may change the parent path, so check only that the suffix matches.
+        assert get_deployment_import_path(d).endswith(
+            "ray.serve.tests.test_util.DecoratedActor"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="File path incorrect on Windows."
+    )
+    def test_replace_main(self):
+
+        temp_fname = "testcase.py"
+        expected_import_path = "testcase.main_f"
+
+        code = (
+            "from ray import serve\n"
+            "from ray.serve.utils import get_deployment_import_path\n"
+            "@serve.deployment\n"
+            "def main_f(*args):\n"
+            "\treturn 'reached main_f'\n"
+            "assert get_deployment_import_path(main_f, replace_main=True) == "
+            f"'{expected_import_path}'"
+        )
+
+        with tempfile.TemporaryDirectory() as dirpath:
+            full_fname = os.path.join(dirpath, temp_fname)
+
+            with open(full_fname, "w+") as f:
+                f.write(code)
+
+            subprocess.check_output(["python", full_fname])
 
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(pytest.main(["-v", "-s", __file__]))

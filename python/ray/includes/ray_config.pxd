@@ -13,7 +13,7 @@ cdef extern from "ray/common/ray_config.h" nogil:
 
         int64_t handler_warning_timeout_ms() const
 
-        int64_t raylet_heartbeat_timeout_milliseconds() const
+        int64_t raylet_heartbeat_period_milliseconds() const
 
         int64_t debug_dump_period_milliseconds() const
 
@@ -53,14 +53,18 @@ cdef extern from "ray/common/ray_config.h" nogil:
 
         int64_t max_direct_call_object_size() const
 
-        c_bool put_small_object_in_memory_store() const
-
-        uint32_t max_tasks_in_flight_per_worker() const
+        int64_t task_rpc_inlined_bytes_limit() const
 
         uint64_t metrics_report_interval_ms() const
 
         c_bool enable_timeline() const
 
-        c_bool automatic_object_deletion_enabled() const
-
         uint32_t max_grpc_message_size() const
+
+        c_bool record_ref_creation_sites() const
+
+        c_bool gcs_grpc_based_pubsub() const
+
+        c_bool start_python_importer_thread() const
+
+        c_bool use_ray_syncer() const

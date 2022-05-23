@@ -1,148 +1,101 @@
-import asyncio
-from functools import singledispatch
+from functools import wraps
 import importlib
 from itertools import groupby
-import json
-import logging
+import pickle
 import random
 import string
 import time
-from typing import Iterable, List, Dict, Tuple
+from typing import Iterable, List, Tuple
 import os
-from ray.serve.exceptions import RayServeException
-from collections import UserDict
-from pathlib import Path
+import traceback
+from enum import Enum
+import __main__
+from ray.actor import ActorHandle
 
-import starlette.requests
 import requests
 import numpy as np
 import pydantic
+import pydantic.json
+import fastapi.encoders
 
 import ray
-from ray.serve.constants import HTTP_PROXY_TIMEOUT
-from ray.ray_constants import MEMORY_RESOURCE_UNIT_BYTES
+import ray.serialization_addons
+from ray.exceptions import RayTaskError
+from ray.util.serialization import StandaloneSerializationContext
+from ray.serve.http_util import build_starlette_request, HTTPRequestWrapper
+from ray.serve.constants import (
+    HTTP_PROXY_TIMEOUT,
+)
 
 ACTOR_FAILURE_RETRY_TIMEOUT_S = 60
 
 
-class ServeMultiDict(UserDict):
-    """Compatible data structure to simulate Starlette Request query_args."""
-
-    def getlist(self, key):
-        """Return the list of items for a given key."""
-        return self.data.get(key, [])
-
-
-class ServeRequest:
-    """The request object used when passing arguments via ServeHandle.
-
-    ServeRequest partially implements the API of Starlette Request. You only
-    need to write your model serving code once; it can be queried by both HTTP
-    and Python.
-
-    To use the full Starlette Request interface with ServeHandle, you may
-    instead directly pass in a Starlette Request object to the ServeHandle.
-    """
-
-    def __init__(self, data, kwargs, headers, method):
-        self._data = data
-        self._kwargs = ServeMultiDict(kwargs)
-        self._headers = headers
-        self._method = method
-
-    @property
-    def headers(self):
-        """The HTTP headers from ``handle.option(http_headers=...)``."""
-        return self._headers
-
-    @property
-    def method(self):
-        """The HTTP method data from ``handle.option(http_method=...)``."""
-        return self._method
-
-    @property
-    def query_params(self):
-        """The keyword arguments from ``handle.remote(**kwargs)``."""
-        return self._kwargs
-
-    async def json(self):
-        """The request dictionary, from ``handle.remote(dict)``."""
-        if not isinstance(self._data, dict):
-            raise RayServeException("Request data is not a dictionary. "
-                                    f"It is {type(self._data)}.")
-        return self._data
-
-    async def form(self):
-        """The request dictionary, from ``handle.remote(dict)``."""
-        if not isinstance(self._data, dict):
-            raise RayServeException("Request data is not a dictionary. "
-                                    f"It is {type(self._data)}.")
-        return self._data
-
-    async def body(self):
-        """The request data from ``handle.remote(obj)``."""
-        return self._data
+# Use a global singleton enum to emulate default options. We cannot use None
+# for those option because None is a valid new value.
+class DEFAULT(Enum):
+    VALUE = 1
 
 
 def parse_request_item(request_item):
-    arg = request_item.args[0] if len(request_item.args) == 1 else None
+    if len(request_item.args) == 1:
+        arg = request_item.args[0]
+        if request_item.metadata.http_arg_is_pickled:
+            assert isinstance(arg, bytes)
+            arg: HTTPRequestWrapper = pickle.loads(arg)
+            return (build_starlette_request(arg.scope, arg.body),), {}
 
-    # If the input data from handle is web request, we don't need to wrap
-    # it in ServeRequest.
-    if isinstance(arg, starlette.requests.Request):
-        return arg
+    return request_item.args, request_item.kwargs
 
-    return ServeRequest(
-        arg,
-        request_item.kwargs,
-        headers=request_item.metadata.http_headers,
-        method=request_item.metadata.http_method,
+
+class _ServeCustomEncoders:
+    """Group of custom encoders for common types that's not handled by FastAPI."""
+
+    @staticmethod
+    def encode_np_array(obj):
+        assert isinstance(obj, np.ndarray)
+        if obj.dtype.kind == "f":  # floats
+            obj = obj.astype(float)
+        if obj.dtype.kind in {"i", "u"}:  # signed and unsigned integers.
+            obj = obj.astype(int)
+        return obj.tolist()
+
+    @staticmethod
+    def encode_np_scaler(obj):
+        assert isinstance(obj, np.generic)
+        return obj.item()
+
+    @staticmethod
+    def encode_exception(obj):
+        assert isinstance(obj, Exception)
+        return str(obj)
+
+
+serve_encoders = {
+    np.ndarray: _ServeCustomEncoders.encode_np_array,
+    np.generic: _ServeCustomEncoders.encode_np_scaler,
+    Exception: _ServeCustomEncoders.encode_exception,
+}
+
+
+def install_serve_encoders_to_fastapi():
+    """Inject Serve's encoders so FastAPI's jsonable_encoder can pick it up."""
+    # https://stackoverflow.com/questions/62311401/override-default-encoders-for-jsonable-encoder-in-fastapi # noqa
+    pydantic.json.ENCODERS_BY_TYPE.update(serve_encoders)
+    # FastAPI cache these encoders at import time, so we also needs to refresh it.
+    fastapi.encoders.encoders_by_class_tuples = (
+        fastapi.encoders.generate_encoders_by_class_tuples(
+            pydantic.json.ENCODERS_BY_TYPE
+        )
     )
 
 
-def _get_logger():
-    logger = logging.getLogger("ray.serve")
-    # TODO(simon): Make logging level configurable.
-    log_level = os.environ.get("SERVE_LOG_DEBUG")
-    if log_level and int(log_level):
-        logger.setLevel(logging.DEBUG)
-    else:
-        logger.setLevel(logging.INFO)
-    return logger
-
-
-logger = _get_logger()
-
-
-class ServeEncoder(json.JSONEncoder):
-    """Ray.Serve's utility JSON encoder. Adds support for:
-        - bytes
-        - Pydantic types
-        - Exceptions
-        - numpy.ndarray
-    """
-
-    def default(self, o):  # pylint: disable=E0202
-        if isinstance(o, bytes):
-            return o.decode("utf-8")
-        if isinstance(o, pydantic.BaseModel):
-            return o.dict()
-        if isinstance(o, Exception):
-            return str(o)
-        if isinstance(o, np.ndarray):
-            if o.dtype.kind == "f":  # floats
-                o = o.astype(float)
-            if o.dtype.kind in {"i", "u"}:  # signed and unsigned integers.
-                o = o.astype(int)
-            return o.tolist()
-        return super().default(o)
-
-
 @ray.remote(num_cpus=0)
-def block_until_http_ready(http_endpoint,
-                           backoff_time_s=1,
-                           check_ready=None,
-                           timeout=HTTP_PROXY_TIMEOUT):
+def block_until_http_ready(
+    http_endpoint,
+    backoff_time_s=1,
+    check_ready=None,
+    timeout=HTTP_PROXY_TIMEOUT,
+):
     http_is_ready = False
     start_time = time.time()
 
@@ -158,8 +111,7 @@ def block_until_http_ready(http_endpoint,
             pass
 
         if 0 < timeout < time.time() - start_time:
-            raise TimeoutError(
-                "HTTP proxy not ready after {} seconds.".format(timeout))
+            raise TimeoutError("HTTP proxy not ready after {} seconds.".format(timeout))
 
         time.sleep(backoff_time_s)
 
@@ -178,159 +130,6 @@ def format_actor_name(actor_name, controller_name=None, *modifiers):
         name += "-{}".format(modifier)
 
     return name
-
-
-def get_conda_env_dir(env_name):
-    """Given a environment name like `tf1`, find and validate the
-    corresponding conda directory. Untested on Windows.
-    """
-    conda_prefix = os.environ.get("CONDA_PREFIX")
-    if conda_prefix is None:
-        # The caller is neither in a conda env or in (base).  This is rare
-        # because by default, new terminals start in (base), but we can still
-        # support this case.
-        conda_exe = os.environ.get("CONDA_EXE")
-        if conda_exe is None:
-            raise RayServeException(
-                "Ray Serve cannot find environment variables set by conda. "
-                "Please verify conda is installed.")
-        # Example: CONDA_EXE=$HOME/anaconda3/bin/python
-        # Strip out the /bin/python by going up two parent directories.
-        conda_prefix = str(Path(conda_exe).parent.parent)
-
-    # There are two cases:
-    # 1. We are in conda base env: CONDA_DEFAULT_ENV=base and
-    #    CONDA_PREFIX=$HOME/anaconda3
-    # 2. We are in user created conda env: CONDA_DEFAULT_ENV=$env_name and
-    #    CONDA_PREFIX=$HOME/anaconda3/envs/$env_name
-    if os.environ.get("CONDA_DEFAULT_ENV") == "base":
-        # Caller is running in base conda env.
-        # Not recommended by conda, but we can still try to support it.
-        env_dir = os.path.join(conda_prefix, "envs", env_name)
-    else:
-        # Now `conda_prefix` should be something like
-        # $HOME/anaconda3/envs/$env_name
-        # We want to strip the $env_name component.
-        conda_envs_dir = os.path.split(conda_prefix)[0]
-        env_dir = os.path.join(conda_envs_dir, env_name)
-    if not os.path.isdir(env_dir):
-        raise ValueError(
-            "conda env " + env_name +
-            " not found in conda envs directory. Run `conda env list` to " +
-            "verify the name is correct.")
-    return env_dir
-
-
-@singledispatch
-def chain_future(src, dst):
-    """Base method for chaining futures together.
-
-    Chaining futures means the output from source future(s) are written as the
-    results of the destination future(s). This method can work with the
-    following inputs:
-        - src: Future, dst: Future
-        - src: List[Future], dst: List[Future]
-    """
-    raise NotImplementedError()
-
-
-@chain_future.register(asyncio.Future)
-def _chain_future_single(src: asyncio.Future, dst: asyncio.Future):
-    asyncio.futures._chain_future(src, dst)
-
-
-@chain_future.register(list)
-def _chain_future_list(src: List[asyncio.Future], dst: List[asyncio.Future]):
-    if len(src) != len(dst):
-        raise ValueError(
-            "Source and destination list doesn't have the same length. "
-            "Source: {}. Destination: {}.".foramt(len(src), len(dst)))
-
-    for s, d in zip(src, dst):
-        chain_future(s, d)
-
-
-def unpack_future(src: asyncio.Future, num_items: int) -> List[asyncio.Future]:
-    """Unpack the result of source future to num_items futures.
-
-    This function takes in a Future and splits its result into many futures. If
-    the result of the source future is an exception, then all destination
-    futures will have the same exception.
-    """
-    dest_futures = [
-        asyncio.get_event_loop().create_future() for _ in range(num_items)
-    ]
-
-    def unwrap_callback(fut: asyncio.Future):
-        exception = fut.exception()
-        if exception is not None:
-            [f.set_exception(exception) for f in dest_futures]
-            return
-
-        result = fut.result()
-        assert len(result) == num_items
-        for item, future in zip(result, dest_futures):
-            future.set_result(item)
-
-    src.add_done_callback(unwrap_callback)
-
-    return dest_futures
-
-
-def try_schedule_resources_on_nodes(
-        requirements: List[dict],
-        ray_resource: Dict[str, Dict] = None,
-) -> List[bool]:
-    """Test given resource requirements can be scheduled on ray nodes.
-
-    Args:
-        requirements(List[dict]): The list of resource requirements.
-        ray_nodes(Optional[Dict[str, Dict]]): The resource dictionary keyed by
-            node id. By default it reads from
-            ``ray.state.state._available_resources_per_node()``.
-    Returns:
-        successfully_scheduled(List[bool]): A list with the same length as
-            requirements. Each element indicates whether or not the requirement
-            can be satisied.
-    """
-
-    if ray_resource is None:
-        ray_resource = ray.state.state._available_resources_per_node()
-
-    successfully_scheduled = []
-
-    for resource_dict in requirements:
-        # Filter out zero value
-        resource_dict = {k: v for k, v in resource_dict.items() if v > 0}
-
-        for node_id, node_resource in ray_resource.items():
-            # Check if we can schedule on this node
-            feasible = True
-
-            for key, count in resource_dict.items():
-                # Fix legacy behaviour in all memory objects
-                if "memory" in key:
-                    memory_resource = node_resource.get(key, 0)
-                    if memory_resource > 0:
-                        # Convert from chunks to bytes
-                        memory_resource *= MEMORY_RESOURCE_UNIT_BYTES
-                    if memory_resource - count < 0:
-                        feasible = False
-
-                elif node_resource.get(key, 0) - count < 0:
-                    feasible = False
-
-            # If we can, schedule it on this node
-            if feasible:
-                for key, count in resource_dict.items():
-                    node_resource[key] -= count
-
-                successfully_scheduled.append(True)
-                break
-        else:
-            successfully_scheduled.append(False)
-
-    return successfully_scheduled
 
 
 def get_all_node_ids():
@@ -353,60 +152,31 @@ def get_all_node_ids():
     return node_ids
 
 
+def node_id_to_ip_addr(node_id: str):
+    """Recovers the IP address for an entry from get_all_node_ids."""
+    if ":" in node_id:
+        node_id = node_id.split(":")[1]
+
+    if "-" in node_id:
+        node_id = node_id.split("-")[0]
+
+    return node_id
+
+
 def get_node_id_for_actor(actor_handle):
     """Given an actor handle, return the node id it's placed on."""
 
-    return ray.actors()[actor_handle._actor_id.hex()]["Address"]["NodeID"]
+    return ray.state.actors()[actor_handle._actor_id.hex()]["Address"]["NodeID"]
 
 
-def import_class(full_path: str):
-    """Given a full import path to a class name, return the imported class.
-
-    For example, the following are equivalent:
-        MyClass = import_class("module.submodule.MyClass")
-        from module.submodule import MyClass
-
-    Returns:
-        Imported class
-    """
-
-    last_period_idx = full_path.rfind(".")
-    class_name = full_path[last_period_idx + 1:]
-    module_name = full_path[:last_period_idx]
-    module = importlib.import_module(module_name)
-    return getattr(module, class_name)
-
-
-class MockImportedBackend:
-    """Used for testing backends.ImportedBackend.
-
-    This is necessary because we need the class to be installed in the worker
-    processes. We could instead mock out importlib but doing so is messier and
-    reduces confidence in the test (it isn't truly end-to-end).
-    """
-
-    def __init__(self, arg):
-        self.arg = arg
-        self.config = None
-
-    def reconfigure(self, config):
-        self.config = config
-
-    def __call__(self, *args):
-        return {"arg": self.arg, "config": self.config}
-
-    async def other_method(self, request):
-        return await request.body()
-
-
-def compute_iterable_delta(old: Iterable,
-                           new: Iterable) -> Tuple[set, set, set]:
+def compute_iterable_delta(old: Iterable, new: Iterable) -> Tuple[set, set, set]:
     """Given two iterables, return the entries that's (added, removed, updated).
 
     Usage:
+        >>> from ray.serve.utils import compute_iterable_delta
         >>> old = {"a", "b"}
         >>> new = {"a", "d"}
-        >>> compute_dict_delta(old, new)
+        >>> compute_iterable_delta(old, new)
         ({"d"}, {"b"}, {"a"})
     """
     old_keys, new_keys = set(old), set(new)
@@ -420,20 +190,19 @@ def compute_dict_delta(old_dict, new_dict) -> Tuple[dict, dict, dict]:
     """Given two dicts, return the entries that's (added, removed, updated).
 
     Usage:
+        >>> from ray.serve.utils import compute_dict_delta
         >>> old = {"a": 1, "b": 2}
         >>> new = {"a": 3, "d": 4}
         >>> compute_dict_delta(old, new)
         ({"d": 4}, {"b": 2}, {"a": 3})
     """
     added_keys, removed_keys, updated_keys = compute_iterable_delta(
-        old_dict.keys(), new_dict.keys())
+        old_dict.keys(), new_dict.keys()
+    )
     return (
-        {k: new_dict[k]
-         for k in added_keys},
-        {k: old_dict[k]
-         for k in removed_keys},
-        {k: new_dict[k]
-         for k in updated_keys},
+        {k: new_dict[k] for k in added_keys},
+        {k: old_dict[k] for k in removed_keys},
+        {k: new_dict[k] for k in updated_keys},
     )
 
 
@@ -451,3 +220,157 @@ def get_current_node_resource_key() -> str:
                     return key
     else:
         raise ValueError("Cannot found the node dictionary for current node.")
+
+
+def ensure_serialization_context():
+    """Ensure the serialization addons on registered, even when Ray has not
+    been started."""
+    ctx = StandaloneSerializationContext()
+    ray.serialization_addons.apply(ctx)
+
+
+def wrap_to_ray_error(function_name: str, exception: Exception) -> RayTaskError:
+    """Utility method to wrap exceptions in user code."""
+
+    try:
+        # Raise and catch so we can access traceback.format_exc()
+        raise exception
+    except Exception as e:
+        traceback_str = ray._private.utils.format_error_message(traceback.format_exc())
+        return ray.exceptions.RayTaskError(function_name, traceback_str, e)
+
+
+def msgpack_serialize(obj):
+    ctx = ray.worker.global_worker.get_serialization_context()
+    buffer = ctx.serialize(obj)
+    serialized = buffer.to_bytes()
+    return serialized
+
+
+def get_deployment_import_path(
+    deployment, replace_main=False, enforce_importable=False
+):
+    """
+    Gets the import path for deployment's func_or_class.
+
+    deployment: A deployment object whose import path should be returned
+    replace_main: If this is True, the function will try to replace __main__
+        with __main__'s file name if the deployment's module is __main__
+    """
+
+    body = deployment._func_or_class
+
+    if isinstance(body, str):
+        # deployment's func_or_class is already an import path
+        return body
+    elif hasattr(body, "__ray_actor_class__"):
+        # If ActorClass, get the class or function inside
+        body = body.__ray_actor_class__
+
+    import_path = f"{body.__module__}.{body.__qualname__}"
+
+    if enforce_importable and "<locals>" in body.__qualname__:
+        raise RuntimeError(
+            "Deployment definitions must be importable to build the Serve app, "
+            f"but deployment '{deployment.name}' is inline defined or returned "
+            "from another function. Please restructure your code so that "
+            f"'{import_path}' can be imported (i.e., put it in a module)."
+        )
+
+    if replace_main:
+        # Replaces __main__ with its file name. E.g. suppose the import path
+        # is __main__.classname and classname is defined in filename.py.
+        # Its import path becomes filename.classname.
+
+        if import_path.split(".")[0] == "__main__" and hasattr(__main__, "__file__"):
+            file_name = os.path.basename(__main__.__file__)
+            extensionless_file_name = file_name.split(".")[0]
+            attribute_name = import_path.split(".")[-1]
+            import_path = f"{extensionless_file_name}.{attribute_name}"
+
+    return import_path
+
+
+def parse_import_path(import_path: str):
+    """
+    Takes in an import_path of form:
+
+    [subdirectory 1].[subdir 2]...[subdir n].[file name].[attribute name]
+
+    Parses this path and returns the module name (everything before the last
+    dot) and attribute name (everything after the last dot), such that the
+    attribute can be imported using "from module_name import attr_name".
+    """
+
+    nodes = import_path.split(".")
+    if len(nodes) < 2:
+        raise ValueError(
+            f"Got {import_path} as import path. The import path "
+            f"should at least specify the file name and "
+            f"attribute name connected by a dot."
+        )
+
+    return ".".join(nodes[:-1]), nodes[-1]
+
+
+class JavaActorHandleProxy:
+    """Wraps actor handle and translate snake_case to camelCase."""
+
+    def __init__(self, handle: ActorHandle):
+        self.handle = handle
+        self._available_attrs = set(dir(self.handle))
+
+    def __getattr__(self, key: str):
+        if key in self._available_attrs:
+            camel_case_key = key
+        else:
+            components = key.split("_")
+            camel_case_key = components[0] + "".join(x.title() for x in components[1:])
+        return getattr(self.handle, camel_case_key)
+
+
+def require_packages(packages: List[str]):
+    """Decorator making sure function run in specified environments
+
+    Examples:
+        >>> from ray.serve.utils import require_packages
+        >>> @require_packages(["numpy", "package_a"]) # doctest: +SKIP
+        ... def func(): # doctest: +SKIP
+        ...     import numpy as np # doctest: +SKIP
+        ...     ... # doctest: +SKIP
+        >>> func() # doctest: +SKIP
+        ImportError: func requires ["numpy", "package_a"] but
+        ["package_a"] are not available, please pip install them.
+    """
+
+    def decorator(func):
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if not hasattr(func, "_require_packages_checked"):
+                missing_packages = []
+                for package in packages:
+                    try:
+                        importlib.import_module(package)
+                    except ModuleNotFoundError:
+                        missing_packages.append(package)
+                if len(missing_packages) > 0:
+                    raise ImportError(
+                        f"{func} requires packages {packages} to run but "
+                        f"{missing_packages} are missing. Please "
+                        "`pip install` them or add them to "
+                        "`runtime_env`."
+                    )
+                setattr(func, "_require_packages_checked", True)
+            return func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
+
+
+def in_interactive_shell():
+    # Taken from:
+    # https://stackoverflow.com/questions/15411967/how-can-i-check-if-code-is-executed-in-the-ipython-notebook
+    import __main__ as main
+
+    return not hasattr(main, "__file__")

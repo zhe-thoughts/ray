@@ -17,7 +17,8 @@ To run this script against a local Unity3D engine:
 
 3) Then run this script (you will have to press Play in your Unity editor
    at some point to start the game and the learning process):
-$ python unity3d_env_local.py --env 3DBall --stop-reward [..] [--torch]?
+$ python unity3d_env_local.py --env 3DBall --stop-reward [..]
+  [--framework=torch]?
 """
 
 import argparse
@@ -34,37 +35,68 @@ parser.add_argument(
     type=str,
     default="3DBall",
     choices=[
-        "3DBall", "3DBallHard", "Pyramids", "SoccerStrikersVsGoalie", "Tennis",
-        "VisualHallway", "Walker"
+        "3DBall",
+        "3DBallHard",
+        "GridFoodCollector",
+        "Pyramids",
+        "SoccerStrikersVsGoalie",
+        "SoccerTwos",
+        "Sorter",
+        "Tennis",
+        "VisualHallway",
+        "Walker",
     ],
     help="The name of the Env to run in the Unity3D editor: `3DBall(Hard)?|"
-    "Pyramids|SoccerStrikersVsGoalie|Tennis|VisualHallway|Walker`"
-    "(feel free to add more and PR!)")
+    "Pyramids|GridFoodCollector|SoccerStrikersVsGoalie|Sorter|Tennis|"
+    "VisualHallway|Walker` (feel free to add more and PR!)",
+)
 parser.add_argument(
     "--file-name",
     type=str,
     default=None,
     help="The Unity3d binary (compiled) game, e.g. "
     "'/home/ubuntu/soccer_strikers_vs_goalie_linux.x86_64'. Use `None` for "
-    "a currently running Unity3D editor.")
+    "a currently running Unity3D editor.",
+)
 parser.add_argument(
     "--from-checkpoint",
     type=str,
     default=None,
     help="Full path to a checkpoint file for restoring a previously saved "
-    "Trainer state.")
+    "Trainer state.",
+)
 parser.add_argument("--num-workers", type=int, default=0)
-parser.add_argument("--as-test", action="store_true")
-parser.add_argument("--stop-iters", type=int, default=9999)
-parser.add_argument("--stop-reward", type=float, default=9999.0)
-parser.add_argument("--stop-timesteps", type=int, default=10000000)
+parser.add_argument(
+    "--as-test",
+    action="store_true",
+    help="Whether this script should be run as a test: --stop-reward must "
+    "be achieved within --stop-timesteps AND --stop-iters.",
+)
+parser.add_argument(
+    "--stop-iters", type=int, default=9999, help="Number of iterations to train."
+)
+parser.add_argument(
+    "--stop-timesteps", type=int, default=10000000, help="Number of timesteps to train."
+)
+parser.add_argument(
+    "--stop-reward",
+    type=float,
+    default=9999.0,
+    help="Reward at which we stop training.",
+)
 parser.add_argument(
     "--horizon",
     type=int,
     default=3000,
     help="The max. number of `step()`s for any episode (per agent) before "
-    "it'll be reset again automatically.")
-parser.add_argument("--torch", action="store_true")
+    "it'll be reset again automatically.",
+)
+parser.add_argument(
+    "--framework",
+    choices=["tf", "tf2", "tfe", "torch"],
+    default="tf",
+    help="The DL framework specifier.",
+)
 
 if __name__ == "__main__":
     ray.init()
@@ -75,15 +107,14 @@ if __name__ == "__main__":
         "unity3d",
         lambda c: Unity3DEnv(
             file_name=c["file_name"],
-            no_graphics=(args.env != "VisualHallway" and
-                         c["file_name"] is not None),
+            no_graphics=(args.env != "VisualHallway" and c["file_name"] is not None),
             episode_horizon=c["episode_horizon"],
-        ))
+        ),
+    )
 
     # Get policies (different agent types; "behaviors" in MLAgents) and
     # the mappings from individual agents to Policies.
-    policies, policy_mapping_fn = \
-        Unity3DEnv.get_policy_configs_for_game(args.env)
+    policies, policy_mapping_fn = Unity3DEnv.get_policy_configs_for_game(args.env)
 
     config = {
         "env": "unity3d",
@@ -135,6 +166,12 @@ if __name__ == "__main__":
             "forward_net_activation": "relu",
             "inverse_net_activation": "relu",
         }
+    elif args.env == "GridFoodCollector":
+        config["model"] = {
+            "conv_filters": [[16, [4, 4], 2], [32, [4, 4], 2], [256, [10, 10], 1]],
+        }
+    elif args.env == "Sorter":
+        config["model"]["use_attention"] = True
 
     stop = {
         "training_iteration": args.stop_iters,
@@ -148,8 +185,10 @@ if __name__ == "__main__":
         config=config,
         stop=stop,
         verbose=1,
-        checkpoint_freq=10,
-        restore=args.from_checkpoint)
+        checkpoint_freq=5,
+        checkpoint_at_end=True,
+        restore=args.from_checkpoint,
+    )
 
     # And check the results.
     if args.as_test:

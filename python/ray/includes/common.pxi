@@ -3,6 +3,7 @@ from libcpp.string cimport string as c_string
 from libcpp.vector cimport vector as c_vector
 
 from ray.includes.common cimport (
+    CObjectLocation,
     CGcsClientOptions,
 )
 
@@ -12,15 +13,12 @@ cdef class GcsClientOptions:
     cdef:
         unique_ptr[CGcsClientOptions] inner
 
-    def __init__(self, redis_ip, int redis_port,
-                 redis_password, c_bool is_test_client=False):
-        if not redis_password:
-            redis_password = ""
+    @classmethod
+    def from_gcs_address(cls, gcs_address):
+        self = GcsClientOptions()
         self.inner.reset(
-            new CGcsClientOptions(redis_ip.encode("ascii"),
-                                  redis_port,
-                                  redis_password.encode("ascii"),
-                                  is_test_client))
+            new CGcsClientOptions(gcs_address.encode("ascii")))
+        return self
 
     cdef CGcsClientOptions* native(self):
         return <CGcsClientOptions*>(self.inner.get())

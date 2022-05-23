@@ -4,10 +4,9 @@ import com.google.common.collect.ImmutableList;
 import io.ray.api.ActorHandle;
 import io.ray.api.ObjectRef;
 import io.ray.api.Ray;
-import io.ray.runtime.exception.RayActorException;
+import io.ray.api.exception.RayActorException;
 import java.util.function.BiConsumer;
 import org.testng.Assert;
-import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
@@ -16,12 +15,7 @@ public class KillActorTest extends BaseTest {
 
   @BeforeClass
   public void setUp() {
-    System.setProperty("ray.job.num-java-workers-per-process", "1");
-  }
-
-  @AfterClass
-  public void tearDown() {
-    System.clearProperty("ray.job.num-java-workers-per-process");
+    System.setProperty("ray.raylet.startup-token", "0");
   }
 
   public static class HangActor {
@@ -59,6 +53,8 @@ public class KillActorTest extends BaseTest {
 
   private void testKillActor(BiConsumer<ActorHandle<?>, Boolean> kill, boolean noRestart) {
     ActorHandle<HangActor> actor = Ray.actor(HangActor::new).setMaxRestarts(1).remote();
+    // Wait for the actor to be created.
+    actor.task(HangActor::ping).remote().get();
     ObjectRef<Boolean> result = actor.task(HangActor::hang).remote();
     // The actor will hang in this task.
     Assert.assertEquals(0, Ray.wait(ImmutableList.of(result), 1, 500).getReady().size());
